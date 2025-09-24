@@ -1,4 +1,4 @@
-from typing import NamedTuple
+from typing import Any, Mapping, NamedTuple, Self
 
 import numpy as np
 
@@ -12,6 +12,52 @@ class SparseMask(NamedTuple):
     coords: tuple[np.ndarray, ...]
     data: np.ndarray
     first: Mask
+
+    def flatten(self) -> dict:
+        """
+        Convert SparseMask to a flat dictionary for saving.
+
+        Returns
+        -------
+        dict
+            Flattened representation with keys like 'axis', 'shape', 'coords[0]', 'data', etc.
+        """
+        result = {"axis": self.axis, "shape": self.shape, "data": self.data}
+
+        for i, coord in enumerate(self.coords):
+            result[f"coords[{i}]"] = coord
+
+        if isinstance(self.first, SparseMask):
+            for k, v in self.first.flatten().items():
+                result[f"first.{k}"] = v
+        else:
+            result["first"] = self.first
+
+        return result
+
+    @classmethod
+    def reconstruct(cls, data: Mapping[str, Any]) -> Self:
+        """
+        Reconstruct SparseMask from a flattened mapping.
+
+        Parameters
+        ----------
+        data : Mapping[str, Any]
+            Flattened representation as produced by `flatten()`.
+
+        Returns
+        -------
+        SparseMask
+            Reconstructed SparseMask instance.
+        """
+
+        return cls(
+            int(data["axis"]),
+            tuple(map(int, data["shape"])),
+            tuple(data[f"coords[{i}]"] for i in range(len([k for k in data if k.startswith("coords")]))),
+            data["data"],
+            data["first"] if "first" in data else cls.reconstruct({key[6:]: value for key, value in data.items() if key.startswith("first.")}),
+        )
 
 
 def _get_diff(arr: np.ndarray) -> tuple[np.ndarray, int]:
@@ -188,7 +234,7 @@ def save(filename: str, mask: np.ndarray) -> None:
     """
     assert mask.dtype == np.uint8
     spmask = _get_sparse_repr(mask.view(dtype=np.int8))
-    np.savez_compressed(filename, allow_pickle=True, data=np.array(spmask, dtype=object))
+    np.savez_compressed(filename, allow_pickle=False, **spmask.flatten())
 
 
 def load(filename: str) -> np.ndarray:
@@ -205,7 +251,7 @@ def load(filename: str) -> np.ndarray:
     mask : np.ndarray
         Restored binary mask array of dtype uint8.
     """
-    spmask = np.load(filename, allow_pickle=True)["data"]
+    spmask = SparseMask.reconstruct(np.load(filename, allow_pickle=False))
     mask = _restore_mask(*spmask)
     assert mask.dtype == np.int8
     return mask.view(dtype=np.uint8)
