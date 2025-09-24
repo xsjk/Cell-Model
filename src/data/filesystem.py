@@ -1,6 +1,8 @@
 import ftplib
 import io
+import json
 import os
+import subprocess
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -12,6 +14,35 @@ import numpy as np
 
 class _FTP(ftplib.FTP_TLS):
     trust_server_pasv_ipv4_address = True  # for proxy
+
+
+def _decode_media_with_ffmpeg(data: bytes) -> np.ndarray:
+    # Get media info
+    res = subprocess.run(
+        ["ffprobe", "-show_entries", "stream=width,height,pix_fmt,nb_frames", "-of", "json", "-"],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.decode("utf-8", errors="ignore"))
+    s = json.loads(res.stdout.decode("utf-8"))["streams"][0]
+    width, height, pix_fmt = int(s["width"]), int(s["height"]), s["pix_fmt"]
+    is_video = "nb_frames" in s
+    is_gray = "gray" in pix_fmt
+
+    # Decode with ffmpeg, uint8 gray/rgb formats only
+    res = subprocess.run(
+        ["ffmpeg", "-i", "pipe:", "-f", "rawvideo", "-pix_fmt", "gray" if is_gray else "rgb24", "pipe:"],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(res.stderr.decode("utf-8", errors="ignore"))
+
+    arr = np.frombuffer(res.stdout, np.uint8)
+    return arr.reshape(((-1,) if is_video else ()) + (height, width) + (() if is_gray else (3,)))
 
 
 class BaseFS(ABC):
@@ -62,15 +93,8 @@ def io_to_numpy(io: IO[bytes], extension: str) -> np.ndarray:
                 assert (data := it.data) is not None
                 return data
 
-        case ".png" | ".jpg" | ".jpeg":
-            import imageio
-
-            return imageio.imread(io)
-
-        case ".mp4":
-            import imageio.v3
-
-            return imageio.v3.imread(io.read(), plugin="pyav", extension=".mp4")
+        case ".png" | ".jpg" | ".jpeg" | ".mp4":
+            return _decode_media_with_ffmpeg(io.read())
 
         case _:
             raise ValueError(f"Unsupported file type: {extension}")
