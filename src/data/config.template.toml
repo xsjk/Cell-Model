@@ -1,0 +1,47 @@
+
+# ============================================================================
+# Remote FTP Server Configuration
+# ============================================================================
+[Remote]
+# FTP connection settings - replace with your server details
+host = "your.ftp.server.com" # FTP server hostname or IP
+port = 21                    # FTP port (usually 21)
+user = "your_username"       # FTP username
+passwd = "your_password"     # FTP password
+# proxy = "socks5://proxy_host:proxy_port" # Optional: Proxy server (socks5 or http), uncomment and set if needed
+
+# Remote dataset paths on the FTP server
+# Support glob patterns (*, ?, []) and lists for multiple patterns
+[Remote.datasets]
+WFM = { images = "/path/to/wfm/images/*.tif", masks = "/path/to/wfm/masks/*.npy" }
+SIM = { images = "/path/to/sim/images/*.tif", masks = "/path/to/sim/masks/*.mrc" }
+SXT = { images = "/path/to/sxt/images/*.mrc", masks = "/path/to/sxt/masks/*.tiff" }
+Cryo-ET = { images = [
+    "/path/to/cryo-et/*denoised.mrc",
+    "/path/to/cryo-et/*denoise.mrc",
+], masks = "/path/to/cryo-et/*_ISG_Filled.mrc" }
+
+# ============================================================================
+# Local Path Configuration
+# ============================================================================
+[Paths]
+# Base directory for all data - CHANGE THIS to your local path
+base_data_dir = "/your/local/data/Cell-Model"
+original_dir = "/your/local/data/Cell-Model/original"     # Downloaded raw data
+compressed_dir = "/your/local/data/Cell-Model/compressed" # Processed/compressed data
+
+# Local dataset subdirectories (relative to original_dir/compressed_dir)
+[Paths.datasets]
+WFM = { images = "WFM/images", masks = "WFM/masks" }
+SIM = { images = "SIM/images", masks = "SIM/masks" }
+SXT = { images = "SXT/images", masks = "SXT/masks" }
+Cryo-ET = { images = "Cryo-ET/images", masks = "Cryo-ET/masks" }
+
+# ============================================================================
+# Dataset-specific Processing Parameters (Optional)
+# ============================================================================
+[Processing]
+# SIM dataset gamma correction parameters
+[Processing.SIM]
+scales = [9.5, 6.5, 5.0]          # Scale factors for each channel
+gammas = [2.5397, 3.8317, 2.8118] # Gamma values for each channel
