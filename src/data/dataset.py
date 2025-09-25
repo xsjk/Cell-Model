@@ -39,10 +39,10 @@ class BaseDataset(ABC):
     dataset_name: str
     reorder_axes: tuple[int, ...] | None = None
 
-    def __init__(self, loading_mode: LoadingMode = LoadingMode.ON_DEMAND):
+    def __init__(self, loading_mode: LoadingMode = LoadingMode.ON_DEMAND, config_path: str | None = None):
         self.loading_mode = loading_mode
 
-        config = load_config()
+        config = load_config(config_path) if config_path is not None else load_config()
         paths = config["Paths"]
         dataset_paths = paths["datasets"][self.dataset_name]
 

@@ -7,10 +7,10 @@ from typing import Callable
 import numpy as np
 from tqdm import tqdm
 
-from . import ndmask
-from .filesystem import LocalFS
-from .utils import auto_clip, keep_largest_connected_component, parametric_standarize, to_mp4, u16_to_u8
-from .utils.config import load as load_config
+from .. import ndmask
+from ..filesystem import LocalFS
+from ..utils import auto_clip, keep_largest_connected_component, parametric_standarize, to_mp4, u16_to_u8
+from ..utils.config import load as load_config
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mrcfile.mrcinterpreter")
 
@@ -54,7 +54,7 @@ class DataCompressor:
         return download_img_dir, download_mask_dir, compressed_img_dir, compressed_mask_dir
 
     def _compress_wfm_single(self, img_file_name, download_img_dir, download_mask_dir, compressed_img_dir, compressed_mask_dir):
-        file_prefix = img_file_name[:-4]  # remove .tif
+        file_prefix = img_file_name[:-4]
         mask_file_name = f"{file_prefix}_PM_NE_mask.npy"
         compressed_img_name = f"{file_prefix}.mp4"
         compressed_mask_name = f"{file_prefix}.npz"
@@ -85,7 +85,7 @@ class DataCompressor:
             return f"Error processing {img_file_name}: {str(e)}"
 
     def _compress_sim_single(self, img_file_name, download_img_dir, download_mask_dir, compressed_img_dir, compressed_mask_dir, best_scales, best_gammas):
-        file_prefix = img_file_name[:-10]  # remove _Actin.tif
+        file_prefix = img_file_name[:-10]
         img_file_names = [f"{file_prefix}_Actin.tif", f"{file_prefix}_ISG.tif", f"{file_prefix}_N.tif"]
         mask_file_names = [f"{file_prefix}_N.mrc", f"{file_prefix}_PM.mrc"]
         compressed_img_name = f"{file_prefix}.mp4"
@@ -121,7 +121,7 @@ class DataCompressor:
 
     def _compress_sxt_single(self, img_file_name, download_img_dir, download_mask_dir, compressed_img_dir, compressed_mask_dir):
         if m := re.match(r"Stevens_pancreatic_I[Nn][Ss]_1E_(?:25mM_|25-10_30min_|3_)?([\d_]*)_pre_rec\.mrc", img_file_name):
-            file_prefix = m.group(1)  # 785_7, ... , 931_9_10
+            file_prefix = m.group(1)
         else:
             return f"Skipped: {img_file_name} (unrecognized file name)"
 
@@ -162,7 +162,7 @@ class DataCompressor:
 
     def _compress_cryo_et_single(self, img_file_name, download_img_dir, download_mask_dir, compressed_img_dir, compressed_mask_dir):
         if m := re.match(r"(\d+_[\d\.]+_\d+)_denoise[d]?\.mrc", img_file_name):
-            file_prefix = m.group(1)  # 20220219_5_2, 20220918_30_001, 20210323_2.8_010, ...
+            file_prefix = m.group(1)
         else:
             return f"Skipped: {img_file_name} (unrecognized file name)"
 
@@ -175,25 +175,18 @@ class DataCompressor:
         compressed_img_path = os.path.join(compressed_img_dir, compressed_img_name)
         compressed_mask_path = os.path.join(compressed_mask_dir, compressed_mask_name)
 
-        # Check common skip conditions
         if skip_reason := self._check_skip_conditions([mask_file_path], [compressed_img_path, compressed_mask_path], img_file_name):
             return skip_reason
 
         try:
-            # Load image and mask
             img = self.fs.read_numpy(img_file_path)
             mask = self.fs.read_numpy(mask_file_path)
-            assert img.dtype == np.float32
-            assert mask.dtype == np.int8
-            assert img.shape == mask.shape
+            assert img.dtype == np.float32 and mask.dtype == np.int8 and img.shape == mask.shape
             mask = mask.view(dtype=np.uint8)
 
-            # Standardize
             img_adjust = parametric_standarize(img, mask=mask)
-            assert img_adjust.dtype == np.uint8
-            assert img_adjust.shape == img.shape
+            assert img_adjust.dtype == np.uint8 and img_adjust.shape == img.shape
 
-            # Compress and save
             to_mp4(img_adjust.reshape(-1, *img.shape[-2:]), compressed_img_path)
             ndmask.save(compressed_mask_path, mask)
 

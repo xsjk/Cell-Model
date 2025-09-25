@@ -6,8 +6,8 @@ import socket
 import socks
 from tqdm import tqdm
 
-from .filesystem import FTPFS
-from .utils.config import load as load_config
+from ..filesystem import FTPFS
+from ..utils.config import load as load_config
 
 
 class DataFetcher:
