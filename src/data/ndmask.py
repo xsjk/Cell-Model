@@ -1,4 +1,4 @@
-from typing import Any, Mapping, NamedTuple, Self
+from typing import IO, Any, Mapping, NamedTuple, Self
 
 import numpy as np
 
@@ -237,7 +237,7 @@ def save(filename: str, mask: np.ndarray) -> None:
     np.savez_compressed(filename, allow_pickle=False, **spmask.flatten())
 
 
-def load(filename: str) -> np.ndarray:
+def load(file: str | IO[bytes]) -> np.ndarray:
     """
     Load a binary mask array from a compressed sparse format.
 
@@ -251,7 +251,7 @@ def load(filename: str) -> np.ndarray:
     mask : np.ndarray
         Restored binary mask array of dtype uint8.
     """
-    spmask = SparseMask.reconstruct(np.load(filename, allow_pickle=False))
+    spmask = SparseMask.reconstruct(np.load(file, allow_pickle=False))
     mask = _restore_mask(*spmask)
     assert mask.dtype == np.int8
     return mask.view(dtype=np.uint8)

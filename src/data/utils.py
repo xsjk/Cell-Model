@@ -58,9 +58,10 @@ def to_mp4(frames: np.ndarray, output_path: str, fps: int = 30, crf: int = 30, p
         raise RuntimeError(f"ffmpeg failed with code {proc.returncode}")
 
 
-def _retrieve_mp4_resolution(data: bytes) -> tuple[int, int, str]:
+def decode_media(data: bytes) -> np.ndarray:
+    # Get media info
     res = subprocess.run(
-        ["ffprobe", "-show_entries", "stream=width,height,pix_fmt", "-of", "json", "-"],
+        ["ffprobe", "-show_entries", "stream=width,height,pix_fmt,nb_frames", "-of", "json", "-"],
         input=data,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -68,36 +69,40 @@ def _retrieve_mp4_resolution(data: bytes) -> tuple[int, int, str]:
     if res.returncode != 0:
         raise RuntimeError(res.stderr.decode("utf-8", errors="ignore"))
     s = json.loads(res.stdout.decode("utf-8"))["streams"][0]
-    return int(s["width"]), int(s["height"]), s["pix_fmt"]
+    width, height, pix_fmt = int(s["width"]), int(s["height"]), s["pix_fmt"]
+    is_video = "nb_frames" in s
+    is_gray = "gray" in pix_fmt
 
-
-def mp4_bytes_to_ndarray(data: bytes) -> np.ndarray:
-    width, height, pix_fmt = _retrieve_mp4_resolution(data)
-    is_gray = pix_fmt == "gray"
-    # fmt: off
+    # Decode with ffmpeg, uint8 gray/rgb formats only
     res = subprocess.run(
-        [
-            "ffmpeg", 
-            "-i", "pipe:",
-            "-f", "rawvideo", 
-            "-pix_fmt", "gray" if is_gray else "rgb24", 
-            "pipe:",
-        ],
+        ["ffmpeg", "-i", "pipe:", "-f", "rawvideo", "-pix_fmt", "gray" if is_gray else "rgb24", "pipe:"],
         input=data,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    # fmt: on
     if res.returncode != 0:
         raise RuntimeError(res.stderr.decode("utf-8", errors="ignore"))
+
     arr = np.frombuffer(res.stdout, np.uint8)
-    return arr.reshape((-1, height, width) if is_gray else (1, height, width, 3))
+    return arr.reshape(((-1,) if is_video else ()) + (height, width) + (() if is_gray else (3,)))
 
 
-def read_mp4(path: str) -> np.ndarray:
+def load_media(path: str) -> np.ndarray:
     with open(path, "rb") as f:
-        data = f.read()
-    return mp4_bytes_to_ndarray(data)
+        return decode_media(f.read())
+
+
+def get_memory_size(obj) -> int:
+    if isinstance(obj, (str, bytes)):
+        return len(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.nbytes
+    elif isinstance(obj, (list, tuple, set)):
+        return sum(get_memory_size(item) for item in obj)
+    elif isinstance(obj, dict):
+        return sum(get_memory_size(k) + get_memory_size(v) for k, v in obj.items())
+    else:
+        raise TypeError(f"Unsupported type: {type(obj)}")
 
 
 def adjust_gamma(image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
