@@ -1,0 +1,29 @@
+import argparse
+
+from . import compress, fetch
+
+parser = argparse.ArgumentParser(
+    description="Data processing tasks for Cell-Model",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog="""
+Examples:
+  python -m src.data fetch                    # Download all datasets
+  python -m src.data compress                 # Compress all datasets
+  python -m src.data all                      # Fetch and compress all datasets
+  python -m src.data fetch --config custom.toml  # Use custom config file
+""",
+)
+
+parser.add_argument("command", choices=["fetch", "compress", "all"], help="Command to execute")
+parser.add_argument("--config", "-c", help="Path to configuration file", default=None)
+
+args = parser.parse_args()
+
+match args.command:
+    case "fetch":
+        fetch.main(config_path=args.config)
+    case "compress":
+        compress.main(config_path=args.config)
+    case "all":
+        fetch.main(config_path=args.config)
+        compress.main(config_path=args.config)
