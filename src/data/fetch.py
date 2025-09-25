@@ -6,8 +6,8 @@ import socket
 import socks
 from tqdm import tqdm
 
-from .config import load_config
 from .filesystem import FTPFS
+from .utils.config import load as load_config
 
 config = load_config()
 remote_config = config["Remote"]
@@ -71,6 +71,6 @@ def fetch_dataset(dataset_name: str):
 
 
 # Fetch all datasets
-for dataset_name in ["WFM", "SIM", "SXT", "Cryo-ET"]:
+for dataset_name in ("WFM", "SIM", "SXT", "Cryo-ET"):
     print(f"Fetching {dataset_name} dataset...")
     fetch_dataset(dataset_name)

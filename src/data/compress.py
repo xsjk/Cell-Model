@@ -7,9 +7,10 @@ from typing import Callable
 import numpy as np
 from tqdm import tqdm
 
-from . import ndmask, utils
-from .config import load_config
+from . import ndmask
 from .filesystem import LocalFS
+from .utils import auto_clip, keep_largest_connected_component, parametric_standarize, to_mp4, u16_to_u8
+from .utils.config import load as load_config
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mrcfile.mrcinterpreter")
 
@@ -86,11 +87,11 @@ def _compress_wfm_single(img_file_name, download_img_dir, download_mask_dir, com
         assert img.shape == mask.shape
 
         # Clip and normalize
-        clip, mask_clip, _ = utils.auto_clip(img, mask, axes=[-2, -1])
+        clip, mask_clip, _ = auto_clip(img, mask, axes=[-2, -1])
         assert clip.shape == mask_clip.shape
 
         # Compress and save
-        utils.to_mp4(clip.transpose(2, 0, 1, 3, 4).reshape(-1, *clip.shape[-2:]), compressed_img_path)
+        to_mp4(clip.transpose(2, 0, 1, 3, 4).reshape(-1, *clip.shape[-2:]), compressed_img_path)
         ndmask.save(compressed_mask_path, mask_clip)
 
         return f"Completed: {img_file_name}"
@@ -125,17 +126,17 @@ def _compress_sim_single(img_file_name, download_img_dir, download_mask_dir, com
         assert img.shape[1:] == mask.shape
 
         # Clip and normalize
-        clip, mask_clip, _ = utils.auto_clip(img, mask, axes=[-3, -2, -1])
+        clip, mask_clip, _ = auto_clip(img, mask, axes=[-3, -2, -1])
         assert clip.shape[1:] == mask_clip.shape
         assert img.dtype == np.uint16
 
         # Gamma correction
         clip_adjust = np.zeros_like(clip, dtype=np.uint8)
         for i in range(3):
-            clip_adjust[i] = utils.u16_to_u8(clip[i], gamma=best_gammas[i], scale=best_scales[i])
+            clip_adjust[i] = u16_to_u8(clip[i], gamma=best_gammas[i], scale=best_scales[i])
 
         # Compress and save
-        utils.to_mp4(clip_adjust.reshape(-1, *clip.shape[-2:]), compressed_img_path)
+        to_mp4(clip_adjust.reshape(-1, *clip.shape[-2:]), compressed_img_path)
         ndmask.save(compressed_mask_path, mask_clip)
 
         return f"Completed: {img_file_name}"
@@ -176,19 +177,19 @@ def _compress_sxt_single(img_file_name, download_img_dir, download_mask_dir, com
         assert mask.dtype == np.uint8
         assert img.shape == mask.shape
 
-        mask = utils.keep_largest_connected_component(mask)
+        mask = keep_largest_connected_component(mask)
 
         # Clip and normalize
-        img_clip, mask_clip, _ = utils.auto_clip(img, mask, axes=[-3, -2, -1])
+        img_clip, mask_clip, _ = auto_clip(img, mask, axes=[-3, -2, -1])
         assert img_clip.shape == mask_clip.shape
         assert img_clip.dtype == np.float32
         assert mask_clip.dtype == np.uint8
 
         # Standardize
-        img_clip_adjust = utils.parametric_standarize(img_clip, mask=mask_clip)
+        img_clip_adjust = parametric_standarize(img_clip, mask=mask_clip)
 
         # Compress and save
-        utils.to_mp4(img_clip_adjust.reshape(-1, *img_clip.shape[-2:]), compressed_img_path)
+        to_mp4(img_clip_adjust.reshape(-1, *img_clip.shape[-2:]), compressed_img_path)
         ndmask.save(compressed_mask_path, mask_clip)
 
         return f"Completed: {img_file_name}"
@@ -225,12 +226,12 @@ def _compress_cryo_et_single(img_file_name, download_img_dir, download_mask_dir,
         mask = mask.view(dtype=np.uint8)
 
         # Standardize
-        img_adjust = utils.parametric_standarize(img, mask=mask)
+        img_adjust = parametric_standarize(img, mask=mask)
         assert img_adjust.dtype == np.uint8
         assert img_adjust.shape == img.shape
 
         # Compress and save
-        utils.to_mp4(img_adjust.reshape(-1, *img.shape[-2:]), compressed_img_path)
+        to_mp4(img_adjust.reshape(-1, *img.shape[-2:]), compressed_img_path)
         ndmask.save(compressed_mask_path, mask)
 
         return f"Completed: {img_file_name}"

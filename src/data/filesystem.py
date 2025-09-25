@@ -1,13 +1,14 @@
 import ftplib
 import io
 import os
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import wraps
-from typing import IO, Callable, Self
+from typing import Callable, Self
 
 import numpy as np
+
+from .utils.file import io_to_numpy
 
 
 class _FTP(ftplib.FTP_TLS):
@@ -36,39 +37,17 @@ class BaseFS(ABC):
         pass
 
 
-def io_to_numpy(io: IO[bytes], extension: str) -> np.ndarray:
-    assert io.readable()
-    assert io.tell() == 0
-    match extension:
-        case ".npy":
-            return np.load(io)
+def auto_reconnect(method: Callable) -> Callable:
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except EOFError:
+            print("Connection lost. Reconnecting...")
+            self.connect()
+            return method(self, *args, **kwargs)
 
-        case ".tif" | ".tiff":
-            import tifffile
-
-            return tifffile.imread(io)
-
-        case ".czi":
-            from czifile import CziFile
-
-            with CziFile(io) as czi:
-                return czi.asarray()
-
-        case ".mrc":
-            from mrcfile.mrcfile import MrcInterpreter
-
-            with warnings.catch_warnings(category=RuntimeWarning, action="ignore"):
-                it = MrcInterpreter(iostream=io, permissive=True)
-                assert (data := it.data) is not None
-                return data
-
-        case ".png" | ".jpg" | ".jpeg" | ".mp4":
-            from .utils import decode_media
-
-            return decode_media(io.read())
-
-        case _:
-            raise ValueError(f"Unsupported file type: {extension}")
+    return wrapper
 
 
 class LocalFS(BaseFS):
@@ -89,19 +68,6 @@ class LocalFS(BaseFS):
 
     def pwd(self) -> str:
         return os.getcwd()
-
-
-def auto_reconnect(method: Callable) -> Callable:
-    @wraps(method)
-    def wrapper(self, *args, **kwargs):
-        try:
-            return method(self, *args, **kwargs)
-        except EOFError:
-            print("Connection lost. Reconnecting...")
-            self.connect()
-            return method(self, *args, **kwargs)
-
-    return wrapper
 
 
 @dataclass

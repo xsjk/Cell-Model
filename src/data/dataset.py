@@ -7,8 +7,9 @@ from typing import TypedDict
 
 import numpy as np
 
-from . import ndmask, utils
-from .config import load_config
+from . import ndmask
+from .utils import media, memory
+from .utils.config import load as load_config
 
 
 class LoadingMode(Enum):
@@ -26,16 +27,17 @@ class ShapeInfo(TypedDict):
 
 
 class SizeInfo(TypedDict):
-    image_cache_mb: float
-    mask_cache_mb: float
-    compressed_cache_mb: float
-    total_mb: float
+    image_cache: int
+    mask_cache: int
+    compressed_cache: int
+    total: int
 
 
 class BaseDataset(ABC):
     mask_ndims: int
     img_ndims: int
     dataset_name: str
+    reorder_axes: tuple[int, ...] | None = None
 
     def __init__(self, loading_mode: LoadingMode = LoadingMode.ON_DEMAND):
         self.loading_mode = loading_mode
@@ -64,20 +66,22 @@ class BaseDataset(ABC):
         assert os.path.exists(self.img_dir) and os.path.exists(self.mask_dir)
         return sorted(prefix for f in glob.glob(os.path.join(self.img_dir, "*.mp4")) if os.path.exists(os.path.join(self.mask_dir, f"{(prefix := os.path.splitext(os.path.basename(f))[0])}.npz")))
 
-    @staticmethod
-    def _decode_media(data: bytes) -> np.ndarray:
-        return utils.decode_media(data)
+    def _decode_media(self, data: bytes) -> np.ndarray:
+        return media.decode_media(data)
 
-    @staticmethod
-    def _decode_mask(data: bytes) -> np.ndarray:
+    def _decode_mask(self, data: bytes) -> np.ndarray:
         with BytesIO(data) as f:
-            return ndmask.load(f)
+            m = ndmask.load(f)
+            if self.reorder_axes is not None:
+                m = m.transpose(self.reorder_axes)
+            return m
 
     def _load_image_from_disk(self, prefix: str) -> np.ndarray:
-        return utils.load_media(os.path.join(self.img_dir, f"{prefix}.mp4"))
+        return media.load_media(os.path.join(self.img_dir, f"{prefix}.mp4"))
 
     def _load_mask_from_disk(self, prefix: str) -> np.ndarray:
-        return ndmask.load(os.path.join(self.mask_dir, f"{prefix}.npz"))
+        with open(os.path.join(self.mask_dir, f"{prefix}.npz"), "rb") as f:
+            return self._decode_mask(f.read())
 
     def _load_compressed_from_disk(self, prefix: str) -> tuple[bytes, bytes]:
         img_path = os.path.join(self.img_dir, f"{prefix}.mp4")
@@ -144,14 +148,13 @@ class BaseDataset(ABC):
                 pass
 
     def get_memory_usage(self) -> SizeInfo:
-        mb = 1024 * 1024
         sizes = SizeInfo(
-            image_cache_mb=utils.get_memory_size(self.img_cache) / mb,
-            mask_cache_mb=utils.get_memory_size(self.mask_cache) / mb,
-            compressed_cache_mb=utils.get_memory_size(self.compressed_cache) / mb,
-            total_mb=0.0,
+            image_cache=memory.get_memory_size(self.img_cache),
+            mask_cache=memory.get_memory_size(self.mask_cache),
+            compressed_cache=memory.get_memory_size(self.compressed_cache),
+            total=0,
         )
-        sizes["total_mb"] = sum(sizes.values())  # type: ignore
+        sizes["total"] = sum(sizes.values())  # type: ignore
         return SizeInfo(**sizes)
 
     @property
@@ -170,6 +173,7 @@ class WFM(BaseDataset):
     mask_ndims = 5
     img_ndims = 5
     dataset_name = "WFM"
+    reorder_axes = (2, 0, 1, 3, 4)  # ZTCXY -> CTZXY
 
 
 class SIM(BaseDataset):

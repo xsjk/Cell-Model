@@ -2,10 +2,10 @@ import tomllib
 from string import Template
 from pathlib import Path
 
-default_config_path = Path(__file__).parent / "config.toml"
+default_config_path = Path(__file__).parent.parent / "config.toml"
 
 
-def load_config(config_path: str | Path = default_config_path):
+def load(config_path: str | Path = default_config_path):
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
     paths = config["Paths"]
