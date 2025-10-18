@@ -134,8 +134,7 @@ class FTPFS(BaseFS):
 
 if __name__ == "__main__":
     import os
-    import tomllib
+    from ..config import load_dataset_config
 
-    with open("config.toml", "rb") as f:
-        ftp_config = tomllib.load(f)["FTP"]
+    ftp_config = load_dataset_config()["Remote"]
     ftp = FTPFS(**ftp_config)

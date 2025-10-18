@@ -9,7 +9,7 @@ import numpy as np
 
 from . import ndmask
 from .utils import media, memory
-from .utils.config import load as load_config
+from ..config import load_dataset_config as load_config
 
 
 class LoadingMode(Enum):

@@ -10,7 +10,7 @@ from tqdm import tqdm
 from .. import ndmask
 from ..filesystem import LocalFS
 from ..utils import auto_clip, keep_largest_connected_component, parametric_standarize, to_mp4, u16_to_u8
-from ..utils.config import load as load_config
+from ...config import load_dataset_config as load_config
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mrcfile.mrcinterpreter")
 

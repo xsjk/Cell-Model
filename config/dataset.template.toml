@@ -16,10 +16,7 @@ passwd = "your_password"     # FTP password
 WFM = { images = "/path/to/wfm/images/*.tif", masks = "/path/to/wfm/masks/*.npy" }
 SIM = { images = "/path/to/sim/images/*.tif", masks = "/path/to/sim/masks/*.mrc" }
 SXT = { images = "/path/to/sxt/images/*.mrc", masks = "/path/to/sxt/masks/*.tiff" }
-Cryo-ET = { images = [
-    "/path/to/cryo-et/*denoised.mrc",
-    "/path/to/cryo-et/*denoise.mrc",
-], masks = "/path/to/cryo-et/*_ISG_Filled.mrc" }
+Cryo-ET = { images = "/path/to/cryo-et/images/*.mrc", masks = "/path/to/cryo-et/masks/*.mrc" }
 
 # ============================================================================
 # Local Path Configuration

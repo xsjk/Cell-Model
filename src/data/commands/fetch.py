@@ -7,7 +7,7 @@ import socks
 from tqdm import tqdm
 
 from ..filesystem import FTPFS
-from ..utils.config import load as load_config
+from ...config import load_dataset_config as load_config
 
 
 class DataFetcher:

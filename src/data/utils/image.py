@@ -1,4 +1,3 @@
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import ndimage
@@ -77,7 +76,7 @@ def adjust_gamma(image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     assert image.dtype == np.uint8
     inv_gamma = 1 / gamma
     table = (np.linspace(0, 1, 256) ** inv_gamma * 255).astype(image.dtype)
-    return cv2.LUT(image, table)
+    return table[image]
 
 
 def calculate_entropy(pixels):
