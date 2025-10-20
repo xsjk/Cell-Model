@@ -35,10 +35,13 @@ class DataCompressor:
         return None
 
     def _process_files_parallel(self, files, process_func, desc, *args):
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        max_workers = min(os.cpu_count() or 1, 32)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(process_func, file_name, *args): file_name for file_name in files}
             for future in tqdm(as_completed(futures), total=len(futures), desc=desc):
-                future.result()
+                res = future.result()
+                if "Error" in res:
+                    print(res)
 
     def get_dataset_dirs(self, dataset_name):
         dataset_paths = self.paths_config["datasets"][dataset_name]

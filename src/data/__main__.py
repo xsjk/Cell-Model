@@ -1,33 +1,55 @@
-import argparse
+from pathlib import Path
+
+import typer
 
 from .commands import compress, fetch, inspect
 
-parser = argparse.ArgumentParser(
-    description="Data processing tasks for Cell-Model",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog="""
-Examples:
-  python -m src.data fetch                    # Download all datasets
-  python -m src.data compress                 # Compress all datasets
-  python -m src.data all                      # Fetch and compress all datasets
-  python -m src.data inspect                  # Inspect dataset information
-  python -m src.data fetch --config custom.toml  # Use custom config file
-""",
+app = typer.Typer(help="Data processing tasks for Cell-Model.")
+
+
+def _config_arg_to_str(config: Path | None) -> str | None:
+    return str(config) if config is not None else None
+
+
+default_config = typer.Option(
+    None,
+    "--config",
+    "-c",
+    exists=True,
+    file_okay=True,
+    dir_okay=False,
+    readable=True,
+    resolve_path=True,
+    help="Path to dataset configuration TOML (defaults to config/dataset.toml).",
 )
 
-parser.add_argument("command", choices=["fetch", "compress", "all", "inspect"], help="Command to execute")
-parser.add_argument("--config", "-c", help="Path to configuration file", default=None)
 
-args = parser.parse_args()
+@app.command("fetch")
+def fetch_main(config: Path | None = default_config) -> None:
+    fetch.main(_config_arg_to_str(config))
 
-match args.command:
-    case "fetch":
-        fetch.main(args.config)
-    case "compress":
-        compress.main(args.config)
-    case "all":
-        fetch.main(args.config)
-        compress.main(args.config)
-        inspect.main(args.config)
-    case "inspect":
-        inspect.main(args.config)
+
+@app.command("compress")
+def compress_main(config: Path | None = default_config) -> None:
+    compress.main(_config_arg_to_str(config))
+
+
+@app.command("inspect")
+def inspect_main(config: Path | None = default_config) -> None:
+    inspect.main(_config_arg_to_str(config))
+
+
+@app.command("all")
+def run_all(config: Path | None = default_config) -> None:
+    config_path = _config_arg_to_str(config)
+    fetch.main(config_path)
+    compress.main(config_path)
+    inspect.main(config_path)
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI
+    main()
