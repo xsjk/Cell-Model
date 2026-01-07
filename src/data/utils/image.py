@@ -55,10 +55,11 @@ def auto_clip(arr: np.ndarray, mask: np.ndarray, scale: bool = True, even: bool 
     assert mask.dtype == np.bool_ or np.issubdtype(mask.dtype, np.unsignedinteger)
     assert arr.shape[-mask.ndim :] == mask.shape
     bound = get_bounding_box(mask > 0, axes=axes, even=even)
+    assert len(bound) == len(axes)
     # access the axes of arr
     slices = [slice(None)] * mask.ndim
-    for ax in axes:
-        slices[ax] = slice(bound[ax].start, bound[ax].stop)
+    for ax, bd in zip(axes, bound):
+        slices[ax] = slice(bd.start, bd.stop)
     arr = arr[..., *slices]
     mask = mask[*slices]
     if scale:
