@@ -37,10 +37,11 @@ class BaseDataset(ABC):
     mask_ndims: int
     img_ndims: int
     dataset_name: str
-    reorder_axes: tuple[int, ...] | None = None
+    channels: int
 
-    def __init__(self, loading_mode: LoadingMode = LoadingMode.ON_DEMAND, config_path: str | None = None):
+    def __init__(self, loading_mode: LoadingMode = LoadingMode.ON_DEMAND, clip: bool = True, config_path: str | None = None):
         self.loading_mode = loading_mode
+        self.clipped = clip
 
         config = load_config(config_path) if config_path is not None else load_config()
         paths = config["Paths"]
@@ -52,6 +53,7 @@ class BaseDataset(ABC):
 
         self.img_cache: dict[str, np.ndarray] = {}
         self.mask_cache: dict[str, np.ndarray] = {}
+        self.bounds_cache: dict[str, np.ndarray] = {}
         self.compressed_cache: dict[str, tuple[bytes, bytes]] = {}
 
         match loading_mode:
@@ -69,17 +71,16 @@ class BaseDataset(ABC):
     def _decode_media(self, data: bytes) -> np.ndarray:
         return media.decode_media(data)
 
-    def _decode_mask(self, data: bytes) -> np.ndarray:
+    def _decode_mask(self, data: bytes) -> tuple[np.ndarray, np.ndarray]:
         with BytesIO(data) as f:
-            m = ndmask.load(f)
-            if self.reorder_axes is not None:
-                m = m.transpose(self.reorder_axes)
-            return m
+            m, extra = ndmask.load(f)
+            bounds = extra["bounds"]
+            return m, bounds
 
     def _load_image_from_disk(self, prefix: str) -> np.ndarray:
         return media.load_media(os.path.join(self.img_dir, f"{prefix}.mp4"))
 
-    def _load_mask_from_disk(self, prefix: str) -> np.ndarray:
+    def _load_mask_from_disk(self, prefix: str) -> tuple[np.ndarray, np.ndarray]:
         with open(os.path.join(self.mask_dir, f"{prefix}.npz"), "rb") as f:
             return self._decode_mask(f.read())
 
@@ -93,55 +94,72 @@ class BaseDataset(ABC):
     def _load_all_data(self):
         for prefix in self.file_list:
             self.img_cache[prefix] = self._load_image_from_disk(prefix)
-            self.mask_cache[prefix] = self._load_mask_from_disk(prefix)
+            self.mask_cache[prefix], self.bounds_cache[prefix] = self._load_mask_from_disk(prefix)
 
     def _load_all_compressed(self):
         for prefix in self.file_list:
             if prefix not in self.compressed_cache:
                 self.compressed_cache[prefix] = self._load_compressed_from_disk(prefix)
 
-    def _get_data(self, prefix) -> tuple[np.ndarray, np.ndarray]:
+    def _get_data(self, prefix) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         match self.loading_mode:
             case LoadingMode.FULL_MEMORY:
-                return self.img_cache[prefix], self.mask_cache[prefix]
+                return self.img_cache[prefix], self.mask_cache[prefix], self.bounds_cache[prefix]
             case LoadingMode.COMPRESSED_CACHE:
                 img_data, mask_data = self.compressed_cache[prefix]
-                return self._decode_media(img_data), self._decode_mask(mask_data)
+                mask, bounds = self._decode_mask(mask_data)
+                return self._decode_media(img_data), mask, bounds
             case LoadingMode.ON_DEMAND:
-                return self._load_image_from_disk(prefix), self._load_mask_from_disk(prefix)
+                mask, bounds = self._load_mask_from_disk(prefix)
+                return self._load_image_from_disk(prefix), mask, bounds
 
-    def _reshape_data(self, img_data: np.ndarray, mask_data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _reshape_data(self, img_data: np.ndarray, mask_data: np.ndarray, bounds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         assert img_data.ndim == 3  # since it is stored as video
-        assert mask_data.ndim == self.mask_ndims  # the loaded mask data should have correct dimensions
+        assert mask_data.ndim == self.mask_ndims >= 3  # the loaded mask data should have correct dimensions
+        assert bounds.shape == (3, 2)
 
-        # Check shape compatibility
-        if self.img_ndims > 3:
-            assert img_data.shape[-2:] == mask_data.shape[-2:]
-        elif self.img_ndims == 3:
-            assert img_data.shape[-3:] == mask_data.shape[-3:]
-        else:
-            raise ValueError(f"img ndims should larger than or equal to mask ndims, got {self.img_ndims} < {self.mask_ndims}")
+        # Create slices for the mask based on bounds (last 3 dims)
+        slices = [slice(None)] * (self.mask_ndims - 3) + [slice(int(s), int(e)) for s, e in bounds]
 
-        # Reshape the image data to target dimensions and match the mask shape
+        # Calculate clipped mask shape by slicing (view)
+        # Note: We use tuple(slices) for indexing
+        mask_clip_shape = mask_data[tuple(slices)].shape
+
         if self.img_ndims == self.mask_ndims:
-            return img_data.reshape(mask_data.shape), mask_data
+            img_clip = img_data.reshape(mask_clip_shape)
         elif self.img_ndims == self.mask_ndims + 1:
-            return img_data.reshape((-1,) + mask_data.shape), mask_data
+            img_clip = img_data.reshape((-1,) + mask_clip_shape)
+            assert self.channels == img_clip.shape[0]
         else:
             raise ValueError(f"Unsupported combination of img ndims and mask ndims: {self.img_ndims}, {self.mask_ndims}")
+
+        if self.clipped:
+            return img_clip, mask_data[tuple(slices)]
+
+        # Reconstruct full-size image and mask
+        if self.img_ndims == self.mask_ndims:
+            img_full = np.zeros(mask_data.shape, dtype=img_data.dtype)
+            img_full[*slices] = img_clip
+        else:
+            img_full = np.zeros((self.channels,) + mask_data.shape, dtype=img_data.dtype)
+            img_full[:, *slices] = img_clip
+
+        return img_full, mask_data
 
     def __len__(self) -> int:
         return len(self.file_list)
 
     def __getitem__(self, index: int | str) -> tuple[np.ndarray, np.ndarray]:
         prefix = self.file_list[index] if isinstance(index, int) else index
-        return self._reshape_data(*self._get_data(prefix))
+        img, mask, bounds = self._get_data(prefix)
+        return self._reshape_data(img, mask, bounds)
 
     def clear_cache(self):
         match self.loading_mode:
             case LoadingMode.FULL_MEMORY:
                 self.img_cache.clear()
                 self.mask_cache.clear()
+                self.bounds_cache.clear()
             case LoadingMode.COMPRESSED_CACHE:
                 self.compressed_cache.clear()
             case LoadingMode.ON_DEMAND:
@@ -150,7 +168,7 @@ class BaseDataset(ABC):
     def get_memory_usage(self) -> SizeInfo:
         sizes = SizeInfo(
             image_cache=memory.get_memory_size(self.img_cache),
-            mask_cache=memory.get_memory_size(self.mask_cache),
+            mask_cache=memory.get_memory_size(self.mask_cache) + memory.get_memory_size(self.bounds_cache),
             compressed_cache=memory.get_memory_size(self.compressed_cache),
             total=0,
         )
@@ -170,25 +188,28 @@ class BaseDataset(ABC):
 
 
 class WFM(BaseDataset):
-    mask_ndims = 5
-    img_ndims = 5
+    mask_ndims = 5  # (C, T, Z, Y, X)
+    img_ndims = 5  # (C, T, Z, Y, X)
     dataset_name = "WFM"
-    reorder_axes = (2, 0, 1, 3, 4)  # ZTCXY -> CTZXY
+    channels = 2
 
 
 class SIM(BaseDataset):
-    mask_ndims = 3
-    img_ndims = 4
+    mask_ndims = 3  # (Z, Y, X)
+    img_ndims = 4  # (C, Z, Y, X)
     dataset_name = "SIM"
+    channels = 3
 
 
 class SXT(BaseDataset):
-    mask_ndims = 3
-    img_ndims = 3
+    mask_ndims = 3  # (Z, Y, X)
+    img_ndims = 3  # (Z, Y, X)
     dataset_name = "SXT"
+    channels = 1
 
 
 class CryoET(BaseDataset):
-    mask_ndims = 3
-    img_ndims = 3
+    mask_ndims = 3  # (Z, Y, X)
+    img_ndims = 3  # (Z, Y, X)
     dataset_name = "Cryo-ET"
+    channels = 1

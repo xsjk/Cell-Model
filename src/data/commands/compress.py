@@ -14,12 +14,14 @@ from ...config import load_dataset_config as load_config
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="mrcfile.mrcinterpreter")
 
+# TODO: save color mapping infomation and implement reverse mapping for SIM, SXT, Cryo-ET datasets
+
 
 class DataCompressor:
     def __init__(self, config_path: str | None = None):
         config = load_config() if config_path is None else load_config(config_path)
         self.paths_config = config["Paths"]
-        self.processing_config = config.get("Processing", {})
+        self.processing_config = config["Processing"]
 
         self.download_dir = self.paths_config["original_dir"]
         self.compressed_dir = self.paths_config["compressed_dir"]
@@ -73,15 +75,17 @@ class DataCompressor:
             return skip_reason
 
         try:
-            img = self.fs.read_numpy(img_file_path)
-            mask = self.fs.read_numpy(mask_file_path)
-            assert img.dtype == np.uint8 and mask.dtype == np.uint8 and img.shape == mask.shape
+            img = self.fs.read_numpy(img_file_path).transpose(2, 0, 1, 3, 4)
+            mask = self.fs.read_numpy(mask_file_path).transpose(2, 0, 1, 3, 4)
+            assert img.dtype == np.uint8 and mask.dtype == np.uint8
+            assert img.ndim == mask.ndim == 5
+            assert img.shape == mask.shape  # (C, T, Z, Y, X)
 
-            clip, mask_clip, _ = auto_clip(img, mask, axes=[-2, -1])
+            clip, mask_clip, bounds = auto_clip(img, mask, axes=[-3, -2, -1])
             assert clip.shape == mask_clip.shape
 
-            to_mp4(clip.transpose(2, 0, 1, 3, 4).reshape(-1, *clip.shape[-2:]), compressed_img_path)
-            ndmask.save(compressed_mask_path, mask_clip)
+            to_mp4(clip.reshape(-1, *clip.shape[-2:]), compressed_img_path)
+            ndmask.save(compressed_mask_path, mask, extra={"bounds": np.array([[s.start, s.stop] for s in bounds], dtype=np.int32)})
 
             return f"Completed: {img_file_name}"
         except Exception as e:
@@ -106,9 +110,11 @@ class DataCompressor:
             img = np.array([self.fs.read_numpy(p) for p in img_file_paths])
             mask = np.sum([self.fs.read_numpy(p) << i for i, p in enumerate(mask_file_paths)], axis=0, dtype=np.uint8)
             assert isinstance(img, np.ndarray) and isinstance(mask, np.ndarray)
-            assert img.dtype == np.uint16 and mask.dtype == np.uint8 and img.shape[1:] == mask.shape
+            assert img.dtype == np.uint16 and mask.dtype == np.uint8
+            assert img.ndim == 4 and mask.ndim == 3
+            assert img.shape[1:] == mask.shape  # (Z, Y, X)
 
-            clip, mask_clip, _ = auto_clip(img, mask, axes=[-3, -2, -1])
+            clip, mask_clip, bounds = auto_clip(img, mask, axes=[-3, -2, -1])
             assert clip.shape[1:] == mask_clip.shape
 
             clip_adjust = np.zeros_like(clip, dtype=np.uint8)
@@ -116,7 +122,7 @@ class DataCompressor:
                 clip_adjust[i] = u16_to_u8(clip[i], gamma=best_gammas[i], scale=best_scales[i])
 
             to_mp4(clip_adjust.reshape(-1, *clip.shape[-2:]), compressed_img_path)
-            ndmask.save(compressed_mask_path, mask_clip)
+            ndmask.save(compressed_mask_path, mask, extra={"bounds": np.array([[s.start, s.stop] for s in bounds], dtype=np.int32)})
 
             return f"Completed: {img_file_name}"
         except Exception as e:
@@ -149,15 +155,17 @@ class DataCompressor:
         try:
             img = self.fs.read_numpy(img_file_path)
             mask = self.fs.read_numpy(mask_file_path)
-            assert img.dtype == np.float32 and mask.dtype == np.uint8 and img.shape == mask.shape
+            assert img.dtype == np.float32 and mask.dtype == np.uint8
+            assert img.ndim == mask.ndim == 3
+            assert img.shape == mask.shape  # (Z, Y, X)
 
             mask = keep_largest_connected_component(mask)
-            img_clip, mask_clip, _ = auto_clip(img, mask, axes=[-3, -2, -1])
+            img_clip, mask_clip, bounds = auto_clip(img, mask, axes=[-3, -2, -1])
             assert img_clip.shape == mask_clip.shape
 
             img_clip_adjust = parametric_standarize(img_clip, mask=mask_clip)
             to_mp4(img_clip_adjust.reshape(-1, *img_clip.shape[-2:]), compressed_img_path)
-            ndmask.save(compressed_mask_path, mask_clip)
+            ndmask.save(compressed_mask_path, mask, extra={"bounds": np.array([[s.start, s.stop] for s in bounds], dtype=np.int32)})
 
             return f"Completed: {img_file_name}"
         except Exception as e:
@@ -184,14 +192,16 @@ class DataCompressor:
         try:
             img = self.fs.read_numpy(img_file_path)
             mask = self.fs.read_numpy(mask_file_path)
-            assert img.dtype == np.float32 and mask.dtype == np.int8 and img.shape == mask.shape
+            assert img.dtype == np.float32 and mask.dtype == np.int8
+            assert img.ndim == mask.ndim == 3
+            assert img.shape == mask.shape
             mask = mask.view(dtype=np.uint8)
 
             img_adjust = parametric_standarize(img, mask=mask)
             assert img_adjust.dtype == np.uint8 and img_adjust.shape == img.shape
 
             to_mp4(img_adjust.reshape(-1, *img.shape[-2:]), compressed_img_path)
-            ndmask.save(compressed_mask_path, mask)
+            ndmask.save(compressed_mask_path, mask, extra={"bounds": np.array([[0, s] for s in mask.shape], dtype=np.int32)})
 
             return f"Completed: {img_file_name}"
         except Exception as e:

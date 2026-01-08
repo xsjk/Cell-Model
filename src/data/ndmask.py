@@ -221,7 +221,7 @@ def _restore_mask(axis: int, shape: tuple[int, ...], coords: tuple[np.ndarray, .
     return np.cumsum(e, axis=axis, dtype=e.dtype, out=e)
 
 
-def save(filename: str, mask: np.ndarray) -> None:
+def save(filename: str, mask: np.ndarray, extra: dict = {}) -> None:
     """
     Save a binary mask array in a compressed sparse format.
 
@@ -231,13 +231,15 @@ def save(filename: str, mask: np.ndarray) -> None:
         Path to the npz file to save the sparse representation.
     mask : np.ndarray
         Input binary mask array of dtype uint8.
+    extra : dict, optional
+        Extra data to save in the npz file.
     """
     assert mask.dtype == np.uint8
     spmask = _get_sparse_repr(mask.view(dtype=np.int8))
-    np.savez_compressed(filename, allow_pickle=False, **spmask.flatten())
+    np.savez_compressed(filename, allow_pickle=False, **spmask.flatten(), **extra)
 
 
-def load(file: str | IO[bytes]) -> np.ndarray:
+def load(file: str | IO[bytes]) -> tuple[np.ndarray, dict]:
     """
     Load a binary mask array from a compressed sparse format.
 
@@ -250,8 +252,16 @@ def load(file: str | IO[bytes]) -> np.ndarray:
     -------
     mask : np.ndarray
         Restored binary mask array of dtype uint8.
+    extra : dict
+        Extra data loaded from the npz file.
     """
-    spmask = SparseMask.reconstruct(np.load(file, allow_pickle=False))
+    data = np.load(file, allow_pickle=False)
+    spmask = SparseMask.reconstruct(data)
     mask = _restore_mask(*spmask)
     assert mask.dtype == np.int8
-    return mask.view(dtype=np.uint8)
+
+    # keys used by SparseMask
+    used_keys = {"axis", "shape", "data", "first"} | {k for k in data if k.startswith("coords") or k.startswith("first.")}
+    extra = {k: v for k, v in data.items() if k not in used_keys}
+
+    return mask.view(dtype=np.uint8), extra

@@ -48,11 +48,11 @@ def load_dataset_config(config_path: str | Path | None = None) -> Mapping[str, A
         raise FileNotFoundError(f"Dataset config '{path}' not found")
 
     config = _load_toml(path)
-    paths = config.get("Paths", {})
-    base_data_dir = paths.get("base_data_dir", "")
+    paths = config["Paths"]
+    base_data_dir = paths["base_data_dir"]
     if base_data_dir:
         for key in ("original_dir", "compressed_dir"):
-            value = paths.get(key, "")
+            value = paths[key]
             if isinstance(value, str) and "${base_data_dir}" in value:
                 paths[key] = value.replace("${base_data_dir}", base_data_dir)
     return config
