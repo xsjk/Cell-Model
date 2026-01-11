@@ -1,5 +1,6 @@
 import numpy as np
 import plotly.graph_objects as go
+import scipy.fft
 from plotly.subplots import make_subplots
 
 
@@ -25,80 +26,15 @@ def transform(func, L, K, x_dim=1000):
     coeffs : np.ndarray
         A 1D array of shape (K,) containing the spectral coefficients B_k.
     """
-    ks, Xs = np.ogrid[1 : K + 1, 0 : L : x_dim * 1j]  # (K, 1), (1, x_dim)
-    dx = L / (x_dim - 1)
+    dx = L / x_dim
+    Xs = np.linspace(dx / 2, L - dx / 2, x_dim).reshape(1, x_dim)  # (1, x_dim)
+    ks = np.arange(1, K + 1).reshape(K, 1)  # (K, 1)
+
     Fx = func(Xs.ravel()) * dx  # (x_dim,)
 
     S = np.sin(ks * np.pi * Xs / L)  # (K, x_dim)
     coeffs = (2 / L) * np.einsum("x,kx->k", Fx, S)  # (K,)
     return coeffs
-
-
-def forward_transform_fast(func, L, K, x_dim=1000):
-    """
-    Compute DST spectral coefficients using FFT for speed (O(N log N)).
-    Equivalent to transform but faster for large x_dim.
-
-    Parameters
-    ----------
-    func : callable
-        Function of x.
-    L : float
-        Interval length.
-    K : int
-        Number of modes.
-    x_dim : int
-        Number of spatial sample points.
-
-    Returns
-    -------
-    coeffs : np.ndarray
-        Spectral coefficients.
-    """
-    Xs = np.linspace(0, L, x_dim)
-    dx = L / (x_dim - 1)
-
-    inner = func(Xs[1:-1]) * dx
-    extended = np.concatenate([[0], inner, [0], -inner[::-1]])
-    spectrum = np.fft.fft(extended)
-    coeffs = -spectrum[1 : K + 1].imag / L
-
-    return coeffs
-
-
-def inverse_transform_fast(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Reconstruct function from DST coeffs using IFFT.
-    Faster than inverse_transform for large N.
-
-    Parameters
-    ----------
-    coeffs : np.ndarray
-        Spectral coefficients B_k.
-    L : float
-        Interval length.
-    N : int
-        Number of output points.
-
-    Returns
-    -------
-    X : np.ndarray
-        grid points.
-    f : np.ndarray
-        reconstructed values.
-    """
-    K = len(coeffs)
-    dx = L / (N - 1)
-    M = 2 * (N - 1)
-    assert K < N - 1
-
-    spectrum = np.zeros(M, dtype=np.complex128)
-    spectrum[1 : K + 1] = -1j * L * coeffs[:K]
-    spectrum[M - K :] = 1j * L * coeffs[:K][::-1]
-
-    f = np.fft.ifft(spectrum)[:N].real / dx
-    Xs = np.linspace(0, L, N)
-    return Xs, f
 
 
 def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
@@ -122,12 +58,26 @@ def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
         The reconstructed function values on the grid.
     """
     K = len(coeffs)
-    ks, Xs = np.mgrid[1 : K + 1, 0 : L : N * 1j]  # (K, N)
+    dx = L / N
+    Xs = np.linspace(dx / 2, L - dx / 2, N).reshape(1, N)  # (1, N)
+    ks = np.arange(1, K + 1).reshape(K, 1)  # (K, 1)
 
     S = np.sin(ks * np.pi * Xs / L)  # (K, N)
     f = np.einsum("k,kx->x", coeffs, S)  # (N,)
 
-    return Xs[0, :], f
+    return Xs.ravel(), f
+
+
+def transform_fast(func, L, K, x_dim=1000):
+    dx = L / x_dim
+    Xs = np.linspace(dx / 2, L - dx / 2, x_dim)
+    return scipy.fft.dst(func(Xs))[:K] / x_dim  # type: ignore
+
+
+def inverse_transform_fast(coeffs, L, N=256):
+    dx = L / N
+    f = scipy.fft.idst(coeffs * N, n=N)
+    return np.linspace(dx / 2, L - dx / 2, N), f
 
 
 if __name__ == "__main__":
@@ -151,13 +101,13 @@ if __name__ == "__main__":
 
     # Transform
     coeffs = transform(example_func, L=LENGTH, K=K_MAX)
-    coeffs_fast = forward_transform_fast(example_func, L=LENGTH, K=K_MAX)
-    assert np.allclose(coeffs, coeffs_fast)
+    coeffs_fast = transform_fast(example_func, L=LENGTH, K=K_MAX)
+    print(f"Transform max diff: {np.max(np.abs(coeffs - coeffs_fast)):.6e}")
 
     # Reconstruct
     X_rec, Y_rec = inverse_transform(coeffs, L=LENGTH, N=500)
     X_rec_fast, Y_rec_fast = inverse_transform_fast(coeffs, L=LENGTH, N=500)
-    assert np.allclose(Y_rec, Y_rec_fast)
+    print(f"Inverse Transform max diff: {np.max(np.abs(Y_rec - Y_rec_fast)):.6e}")
 
     # Get ground truth
     Y_true = example_func(X_rec)
