@@ -112,6 +112,11 @@ if __name__ == "__main__":
     # Get ground truth
     Y_true = example_func(X_rec)
 
+    # Display errors
+    print("\nError vs Ground Truth:")
+    print(f"MAE: {np.max(np.abs(Y_true - Y_rec)):.6e}")
+    print(f"RMSE: {np.sqrt(np.mean((Y_true - Y_rec) ** 2)):.6e}")
+
     # Visualization
     fig = make_subplots(rows=1, cols=1, subplot_titles=(f"Original vs Reconstructed (K={K_MAX}, L={LENGTH})",))
     fig.add_trace(go.Scatter(x=X_rec, y=Y_true, mode="lines", name="Original Function"))
