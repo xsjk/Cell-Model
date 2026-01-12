@@ -6,8 +6,15 @@ from plotly.subplots import make_subplots
 
 def transform(func, L, K, x_dim=1000):
     """
-    Compute the Discrete Sine Transform (DST) spectral coefficients of a function defined on [0, L].
-    Implements a discretized version of the continuous sine transform integral.
+    Use the sine basis to compute the spectral coefficients of a real-valued function defined on an interval [0, L].
+    The function should satisfy Dirichlet boundary conditions f(0) = f(L) = 0.
+
+        **Domain**:
+            Interval = I = [0, L]
+
+        **Basis**:
+            Sine basis: sin(k * pi * x / L)
+            for k = 1, 2, ..., K.
 
     Parameters
     ----------
@@ -39,7 +46,7 @@ def transform(func, L, K, x_dim=1000):
 
 def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
     """
-    Reconstruct the function from its DST spectral coefficients.
+    Reconstruct the function from its sine spectral coefficients.
 
     Parameters
     ----------
@@ -69,12 +76,23 @@ def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
 
 
 def transform_fast(func, L, K, x_dim=1000):
+    """
+    Fast computation of the sine spectral coefficients using the Discrete Sine Transform (DST).
+    The function should satisfy Dirichlet boundary conditions f(0) = f(L) = 0.
+
+    See the `transform` function for interface details.
+    """
     dx = L / x_dim
     Xs = np.linspace(dx / 2, L - dx / 2, x_dim)
     return scipy.fft.dst(func(Xs))[:K] / x_dim  # type: ignore
 
 
 def inverse_transform_fast(coeffs, L, N=256):
+    """
+    Fast reconstruction of the function from its sine spectral coefficients using the Inverse Discrete Sine Transform (IDST).
+
+    See the `inverse_transform` function for interface details.
+    """
     dx = L / N
     f = scipy.fft.idst(coeffs * N, n=N)
     return np.linspace(dx / 2, L - dx / 2, N), f
