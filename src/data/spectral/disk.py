@@ -2,10 +2,8 @@ from functools import cache
 from typing import Literal
 
 import numpy as np
-import plotly.graph_objects as go
 import scipy.fft
 import scipy.special as sp
-from plotly.subplots import make_subplots
 from scipy.integrate import simpson
 from scipy.interpolate import RegularGridInterpolator, interp1d
 
@@ -254,6 +252,8 @@ def inverse_transform_fast(coeffs, R, N=256, N_theta=None) -> tuple[np.ndarray, 
 
 
 if __name__ == "__main__":
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     def example_func(r, theta):
         x = r * np.cos(theta)
@@ -300,12 +300,12 @@ if __name__ == "__main__":
     fig.add_trace(go.Surface(x=X, y=Y, z=Z_rec, colorscale="Viridis", showscale=False), row=1, col=2)
     fig.add_trace(go.Surface(x=X, y=Y, z=np.abs(Z_true - Z_rec), colorscale="Plasma", showscale=True), row=1, col=3)
 
-    scene_cam = dict(aspectratio=dict(x=1, y=1, z=0.5))
+    scene_config = dict(aspectratio=dict(x=1, y=1, z=0.5))
     fig.update_layout(
         title_text="Fourier-Bessel Spectral Decomposition on Disk",
         template="plotly_dark",
-        scene=scene_cam,
-        scene2=scene_cam,
-        scene3=scene_cam,
+        scene=scene_config,
+        scene2=scene_config,
+        scene3=scene_config,
     )
-    fig.write_html("fourier_bessel_decomposition.html")
+    fig.write_html("fourier_bessel_decomposition.html", include_plotlyjs="cdn")

@@ -1,7 +1,5 @@
 import numpy as np
-import plotly.graph_objects as go
 import scipy.fft
-from plotly.subplots import make_subplots
 
 
 def samples(N):
@@ -121,6 +119,8 @@ def inverse_transform_fast(coeffs, L, N=256):
 
 
 if __name__ == "__main__":
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
     def example_func(x):
         mu1, sigma1 = 30, 10
@@ -166,4 +166,4 @@ if __name__ == "__main__":
         title_text="Discrete Sine Transform (DST) Spectral Decomposition",
         template="plotly_dark",
     )
-    fig.write_html("dst_decomposition.html")
+    fig.write_html("dst_decomposition.html", include_plotlyjs="cdn")

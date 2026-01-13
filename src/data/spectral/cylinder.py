@@ -1,9 +1,7 @@
 from typing import Literal
 
 import numpy as np
-import plotly.graph_objects as go
 import scipy.fft
-from plotly.subplots import make_subplots
 from scipy.integrate import simpson
 from scipy.interpolate import RegularGridInterpolator, interp1d
 
@@ -232,6 +230,10 @@ def inverse_transform_fast(coeffs, R, L, N_xy=100, N_z=100, N_r=None, N_theta=No
 
 
 if __name__ == "__main__":
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    from ...visualization.objects import VoxelIsosurface
 
     def example_func(r, theta, z):
         x = r * np.cos(theta)
@@ -246,8 +248,8 @@ if __name__ == "__main__":
     K_R = 10  # radial modes
     K_Z = 10  # longitudinal modes
     N_R = 50
-    N_XY = 60
-    N_Z = 45
+    N_XY = 200
+    N_Z = 150
 
     # Transform
     coeffs = transform(example_func, R=R, L=L, M=M, K_r=K_R, K_z=K_Z, N_r=N_R, N_z=N_Z)
@@ -264,6 +266,7 @@ if __name__ == "__main__":
     # Get ground truth
     Vol_true = example_func(Rs, Ts, Zs)
     Vol_true[Rs > R] = 0
+    vmin, vmax = Vol_true.min(), Vol_true.max()
 
     # Display errors
     print("\nError vs Ground Truth:")
@@ -284,38 +287,38 @@ if __name__ == "__main__":
         ),
     )
 
-    fig.add_trace(
-        go.Volume(
-            x=Xs.flatten(),
-            y=Ys.flatten(),
-            z=Zs.flatten(),
-            value=Vol_true.flatten(),
-            isomin=-0.8,
-            isomax=0.8,
+    fig.add_traces(
+        VoxelIsosurface(
+            x_range=(-R, R),
+            y_range=(-R, R),
+            z_range=(0, L),
+            value=Vol_true,
+            isomin=vmin,
+            isomax=vmax,
             opacity=0.2,
-            surface_count=30,
+            surface_count=20,
             colorscale="Viridis",
             showscale=False,
         ),
-        row=1,
-        col=1,
+        rows=1,
+        cols=1,
     )
 
-    fig.add_trace(
-        go.Volume(
-            x=Xs.flatten(),
-            y=Ys.flatten(),
-            z=Zs.flatten(),
-            value=Vol_rec.flatten(),
-            isomin=-0.8,
-            isomax=0.8,
+    fig.add_traces(
+        VoxelIsosurface(
+            x_range=(-R, R),
+            y_range=(-R, R),
+            z_range=(0, L),
+            value=Vol_rec,
+            isomin=vmin,
+            isomax=vmax,
             opacity=0.2,
-            surface_count=30,
+            surface_count=20,
             colorscale="Viridis",
             showscale=False,
         ),
-        row=1,
-        col=2,
+        rows=1,
+        cols=2,
     )
 
     # Plot the error slices through the max error point
@@ -342,32 +345,37 @@ if __name__ == "__main__":
             col=2,
         )
 
-    fig.add_trace(
-        go.Volume(
-            x=Xs.flatten(),
-            y=Ys.flatten(),
-            z=Zs.flatten(),
-            value=abs_err.flatten(),
+    fig.add_traces(
+        VoxelIsosurface(
+            x_range=(-R, R),
+            y_range=(-R, R),
+            z_range=(0, L),
+            value=abs_err,
             isomin=0.1 * max_abs_err,
             isomax=max_abs_err,
             opacity=0.2,
-            surface_count=30,
+            surface_count=20,
             colorscale="Hot",
             showscale=True,
             colorbar=dict(title="Abs Error"),
         ),
-        row=1,
-        col=3,
+        rows=1,
+        cols=3,
     )
 
-    scene_cam = dict(aspectratio=dict(x=1, y=1, z=L / (R * 2)))
+    scene_config = dict(
+        xaxis=dict(range=[-R, R]),
+        yaxis=dict(range=[-R, R]),
+        zaxis=dict(range=[0, L]),
+        aspectratio=dict(x=1, y=1, z=L / (R * 2)),
+    )
     fig.update_layout(
         title="Cylinder Spectral Decomposition (B^2 x I)",
         template="plotly_dark",
-        scene=scene_cam,
-        scene2=scene_cam,
-        scene3=scene_cam,
+        scene=scene_config,
+        scene2=scene_config,
+        scene3=scene_config,
     )
 
     output_file = "cylinder_decomposition.html"
-    fig.write_html(output_file)
+    fig.write_html(output_file, include_plotlyjs="cdn")
