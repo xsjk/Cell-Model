@@ -10,6 +10,29 @@ from scipy.integrate import simpson
 from scipy.interpolate import RegularGridInterpolator, interp1d
 
 
+def soft_mask(r, R=1, margin=None):
+    """
+    Create a soft mask that smoothly transitions from 1 to 0 near the boundary of the disk of radius R.
+    Use cosine tapering over the specified margin.
+
+    Parameters
+    ----------
+    r : np.ndarray
+        Radial coordinates.
+    R : float
+        Radius of the disk.
+    margin : float, optional
+        Width over which to apply the smooth transition.
+    """
+    if margin is None:
+        margin = R
+    assert 0 <= margin <= R, "margin must be less than R"
+    if margin == 0:
+        return (r <= R).astype(float)
+    y = 0.5 * (1 + np.cos(np.pi * (r - (R - margin)) / margin))
+    return (r < R - margin) + (r >= R - margin) * y
+
+
 @cache
 def _get_alphas(M: int, K: int) -> np.ndarray:
     return np.array([sp.jn_zeros(n, K) for n in range(M + 1)])  # (M+1, K)
@@ -205,10 +228,11 @@ def transform_fast(func, R, M, K, N_r=200, N_theta=None, method: Literal["legend
     return coeffs
 
 
-def inverse_transform_fast(coeffs, R, N=256) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def inverse_transform_fast(coeffs, R, N=256, N_theta=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     M, K = coeffs.shape[0] - 1, coeffs.shape[1]
     N_r = int(np.hypot(N, N))
-    N_theta: int = scipy.fft.next_fast_len(int(2 * np.pi * N))  # type: ignore
+    N_theta = N_theta or scipy.fft.next_fast_len(int(2 * np.pi * N))  # type: ignore
+    assert isinstance(N_theta, int)
 
     t = np.linspace(0, 2 * np.pi, N_theta + 1)  # (N_theta+1,)
 
@@ -236,30 +260,29 @@ if __name__ == "__main__":
         y = r * np.sin(theta)
         z1 = np.exp(-((x - 80) ** 2 + y**2) / (2 * 40**2))
         z2 = -0.8 * np.exp(-((x + 80) ** 2 + (y - 50) ** 2) / (2 * 30**2))
-        return z1 + z2
+        return (z1 + z2) * soft_mask(r, R=R)
 
-    RADIUS = 256
-    M_MAX = 20  # angular orders
-    K_MAX = 20  # radial modes
-    N_R = 500
-    N_THETA = 50
+    R = 256
+    M = 20  # angular orders
+    K = 10  # radial modes
+    N_R = 200
 
     # Transform (Normal vs Fast)
-    coeffs_normal = transform(example_func, R=RADIUS, M=M_MAX, K=K_MAX, N_r=N_R, N_theta=N_THETA, method="legendre")
-    coeffs_fast = transform_fast(example_func, R=RADIUS, M=M_MAX, K=K_MAX, N_r=N_R, N_theta=N_THETA, method="legendre")
+    coeffs_normal = transform(example_func, R=R, M=M, K=K, N_r=N_R)
+    coeffs_fast = transform_fast(example_func, R=R, M=M, K=K, N_r=N_R)
     print(f"Transform Diff (Normal vs Fast): {np.max(np.abs(coeffs_normal - coeffs_fast)):.6e}")
 
     # Reconstruct (Inverse vs Inverse Fast)
-    X, Y, Z_rec = inverse_transform(coeffs_normal, R=RADIUS, N=N_R)
-    _, _, Z_rec_fast = inverse_transform_fast(coeffs_normal, R=RADIUS, N=N_R)
+    X, Y, Z_rec = inverse_transform(coeffs_normal, R=R, N=N_R)
+    _, _, Z_rec_fast = inverse_transform_fast(coeffs_normal, R=R, N=N_R)
     print(f"Reconstruction Diff (Regular vs Fast): {np.nanmax(np.abs(Z_rec - Z_rec_fast)):.6e}")
 
     # Get ground truth
     R_grid = np.sqrt(X**2 + Y**2)
     T_grid = np.arctan2(Y, X)
     Z_true = example_func(R_grid, T_grid)
-    Z_true[R_grid > RADIUS] = np.nan
-    Z_rec[R_grid > RADIUS] = np.nan
+    Z_true[R_grid > R] = np.nan
+    Z_rec[R_grid > R] = np.nan
 
     # Display errors
     print("\nError vs Ground Truth:")
@@ -269,17 +292,20 @@ if __name__ == "__main__":
     # Visualization
     fig = make_subplots(
         rows=1,
-        cols=2,
-        specs=[[{"type": "surface"}, {"type": "surface"}]],
-        subplot_titles=("Original Function f(r, theta)", f"Reconstructed (M={M_MAX}, K={K_MAX})"),
+        cols=3,
+        specs=[[{"type": "surface"}, {"type": "surface"}, {"type": "surface"}]],
+        subplot_titles=("Original", f"Reconstructed (M={M}, K={K})", "Absolute Error"),
     )
     fig.add_trace(go.Surface(x=X, y=Y, z=Z_true, colorscale="Viridis", showscale=False), row=1, col=1)
     fig.add_trace(go.Surface(x=X, y=Y, z=Z_rec, colorscale="Viridis", showscale=False), row=1, col=2)
+    fig.add_trace(go.Surface(x=X, y=Y, z=np.abs(Z_true - Z_rec), colorscale="Plasma", showscale=True), row=1, col=3)
+
+    scene_cam = dict(aspectratio=dict(x=1, y=1, z=0.5))
     fig.update_layout(
         title_text="Fourier-Bessel Spectral Decomposition on Disk",
         template="plotly_dark",
-        height=800,
-        scene=dict(aspectratio=dict(x=1, y=1, z=0.5)),
-        scene2=dict(aspectratio=dict(x=1, y=1, z=0.5)),
+        scene=scene_cam,
+        scene2=scene_cam,
+        scene3=scene_cam,
     )
     fig.write_html("fourier_bessel_decomposition.html")

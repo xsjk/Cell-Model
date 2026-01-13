@@ -8,6 +8,30 @@ def samples(N):
     return np.linspace(1 / (2 * N), 1 - 1 / (2 * N), N)
 
 
+def soft_mask(x, L=1.0, margin=None):
+    """
+    Create a soft mask that smoothly transitions from 1 to 0 near the boundaries of the interval [0, L].
+    Use cosine tapering over the specified margin.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Input array of points where the mask is evaluated.
+    L : float
+        The length of the interval.
+    margin : float, optional
+        The width over which the mask transitions from 1 to 0 at the boundaries.
+    """
+    if margin is None:
+        margin = L / 2
+    assert 0 <= margin <= L / 2, "margin must be less than L/2"
+    if margin == 0:
+        return ((x >= 0) & (x <= L)).astype(float)
+    y1 = 0.5 * (1 - np.cos(np.pi * x / margin))
+    y2 = 0.5 * (1 - np.cos(np.pi * (L - x) / margin))
+    return (x < margin) * y1 + (x > L - margin) * y2 + ((x >= margin) & (x <= L - margin))
+
+
 def transform(func, L, K, N=1000):
     """
     Use the sine basis to compute the spectral coefficients of a real-valued function defined on an interval [0, L].
@@ -99,30 +123,24 @@ def inverse_transform_fast(coeffs, L, N=256):
 if __name__ == "__main__":
 
     def example_func(x):
-        # A function satisfying f(0)=f(L)=0
-        # Combination of gaussians dampened at borders
         mu1, sigma1 = 30, 10
         mu2, sigma2 = 70, 15
-
         g1 = np.exp(-((x - mu1) ** 2) / (2 * sigma1**2))
         g2 = -0.5 * np.exp(-((x - mu2) ** 2) / (2 * sigma2**2))
+        return (g1 + g2) * soft_mask(x, L=L)
 
-        # Enforce boundary conditions cleanly (though gaussians are near 0 approx)
-        # Multiply by window function sin(pi*x/L) to ensure exact zero at boundaries
-        boundary_window = np.sin(np.pi * x / 100)
-        return (g1 + g2) * boundary_window
-
-    LENGTH = 100.0
-    K_MAX = 20  # Number of sine modes
+    L = 100.0  # Length of the interval
+    K = 20  # Number of sine modes
+    N = 500  # Number of sample points for reconstruction
 
     # Transform
-    coeffs = transform(example_func, L=LENGTH, K=K_MAX)
-    coeffs_fast = transform_fast(example_func, L=LENGTH, K=K_MAX)
+    coeffs = transform(example_func, L=L, K=K)
+    coeffs_fast = transform_fast(example_func, L=L, K=K)
     print(f"Transform max diff: {np.max(np.abs(coeffs - coeffs_fast)):.6e}")
 
     # Reconstruct
-    X_rec, Y_rec = inverse_transform(coeffs, L=LENGTH, N=500)
-    X_rec_fast, Y_rec_fast = inverse_transform_fast(coeffs, L=LENGTH, N=500)
+    X_rec, Y_rec = inverse_transform(coeffs, L=L, N=N)
+    X_rec_fast, Y_rec_fast = inverse_transform_fast(coeffs, L=L, N=N)
     print(f"Inverse Transform max diff: {np.max(np.abs(Y_rec - Y_rec_fast)):.6e}")
 
     # Get ground truth
@@ -134,14 +152,18 @@ if __name__ == "__main__":
     print(f"RMSE: {np.sqrt(np.mean((Y_true - Y_rec) ** 2)):.6e}")
 
     # Visualization
-    fig = make_subplots(rows=1, cols=1, subplot_titles=(f"Original vs Reconstructed (K={K_MAX}, L={LENGTH})",))
-    fig.add_trace(go.Scatter(x=X_rec, y=Y_true, mode="lines", name="Original Function"))
-    fig.add_trace(go.Scatter(x=X_rec, y=Y_rec, mode="lines", name="Reconstructed", line=dict(dash="dash")))
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        subplot_titles=(f"Original vs Reconstructed (K={K}, L={L})", "Absolute Error"),
+        vertical_spacing=0.15,
+    )
+    fig.add_trace(go.Scatter(x=X_rec, y=Y_true, mode="lines", name="Original"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=X_rec, y=Y_rec, mode="lines", name="Reconstructed", line=dict(dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=X_rec, y=np.abs(Y_true - Y_rec), mode="lines", name="Error", line=dict(color="crimson")), row=2, col=1)
+
     fig.update_layout(
         title_text="Discrete Sine Transform (DST) Spectral Decomposition",
         template="plotly_dark",
-        height=600,
-        xaxis_title="x",
-        yaxis_title="f(x)",
     )
     fig.write_html("dst_decomposition.html")
