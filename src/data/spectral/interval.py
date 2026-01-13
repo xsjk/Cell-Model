@@ -4,7 +4,11 @@ import scipy.fft
 from plotly.subplots import make_subplots
 
 
-def transform(func, L, K, x_dim=1000):
+def samples(N):
+    return np.linspace(1 / (2 * N), 1 - 1 / (2 * N), N)
+
+
+def transform(func, L, K, N=1000):
     """
     Use the sine basis to compute the spectral coefficients of a real-valued function defined on an interval [0, L].
     The function should satisfy Dirichlet boundary conditions f(0) = f(L) = 0.
@@ -25,7 +29,7 @@ def transform(func, L, K, x_dim=1000):
         The length of the interval.
     K : int
         The number of sine modes to compute.
-    x_dim : int, optional
+    N : int, optional
         Number of spatial sample points for numerical integration.
 
     Returns
@@ -33,14 +37,11 @@ def transform(func, L, K, x_dim=1000):
     coeffs : np.ndarray
         A 1D array of shape (K,) containing the spectral coefficients B_k.
     """
-    dx = L / x_dim
-    Xs = np.linspace(dx / 2, L - dx / 2, x_dim).reshape(1, x_dim)  # (1, x_dim)
-    ks = np.arange(1, K + 1).reshape(K, 1)  # (K, 1)
-
-    Fx = func(Xs.ravel()) * dx  # (x_dim,)
-
-    S = np.sin(ks * np.pi * Xs / L)  # (K, x_dim)
-    coeffs = (2 / L) * np.einsum("x,kx->k", Fx, S)  # (K,)
+    x = samples(N)  # (N，)
+    k = np.arange(1, K + 1)  # (K,)
+    f = func(x * L)  # (N,)
+    S = np.sin(k[:, None] * np.pi * x[None, :])  # (K, N)
+    coeffs = 2 / N * np.einsum("x,kx->k", f, S)  # (K,)
     return coeffs
 
 
@@ -65,26 +66,23 @@ def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
         The reconstructed function values on the grid.
     """
     K = len(coeffs)
-    dx = L / N
-    Xs = np.linspace(dx / 2, L - dx / 2, N).reshape(1, N)  # (1, N)
-    ks = np.arange(1, K + 1).reshape(K, 1)  # (K, 1)
-
-    S = np.sin(ks * np.pi * Xs / L)  # (K, N)
+    x = samples(N)  # (N，)
+    k = np.arange(1, K + 1)  # (K,)
+    S = np.sin(k[:, None] * np.pi * x[None, :])  # (K, N)
     f = np.einsum("k,kx->x", coeffs, S)  # (N,)
+    return x * L, f
 
-    return Xs.ravel(), f
 
-
-def transform_fast(func, L, K, x_dim=1000):
+def transform_fast(func, L, K, N=1000):
     """
     Fast computation of the sine spectral coefficients using the Discrete Sine Transform (DST).
     The function should satisfy Dirichlet boundary conditions f(0) = f(L) = 0.
 
     See the `transform` function for interface details.
     """
-    dx = L / x_dim
-    Xs = np.linspace(dx / 2, L - dx / 2, x_dim)
-    return scipy.fft.dst(func(Xs))[:K] / x_dim  # type: ignore
+    x = samples(N)  # (N，)
+    f = func(x * L)  # (N,)
+    return scipy.fft.dst(f, overwrite_x=True)[:K] / N  # type: ignore
 
 
 def inverse_transform_fast(coeffs, L, N=256):
@@ -93,9 +91,9 @@ def inverse_transform_fast(coeffs, L, N=256):
 
     See the `inverse_transform` function for interface details.
     """
-    dx = L / N
-    f = scipy.fft.idst(coeffs * N, n=N)
-    return np.linspace(dx / 2, L - dx / 2, N), f
+    x = samples(N)  # (N，)
+    f = scipy.fft.idst(coeffs * N, n=N, overwrite_x=True)
+    return x * L, f
 
 
 if __name__ == "__main__":

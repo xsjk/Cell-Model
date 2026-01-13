@@ -7,10 +7,10 @@ from plotly.subplots import make_subplots
 from scipy.integrate import simpson
 from scipy.interpolate import RegularGridInterpolator, interp1d
 
-from .disk import get_bessel_basis, get_bessel_norm_factors, get_legendre_basis
+from . import disk, interval
 
 
-def transform(func, R, L, M, K_r, K_z, N_r=60, N_theta=200, N_z=60, method: Literal["legendre", "simpson"] = "legendre"):
+def transform(func, R, L, M, K_r, K_z, N_r=60, N_theta=None, N_z=60, method: Literal["legendre", "simpson", "dht"] = "legendre"):
     """
     Compute the Fourier-Bessel-Sine spectral coefficients of a real-valued function defined on a cylinder.
 
@@ -44,50 +44,47 @@ def transform(func, R, L, M, K_r, K_z, N_r=60, N_theta=200, N_z=60, method: Lite
     N_z : int
         Number of longitudinal (z) sample points.
     method : str
-        'legendre': Uses Gauss-Legendre quadrature for radial direction (Spectral accuracy).
+        'legendre': Uses Gauss-Legendre quadrature for radial direction.
         'simpson': Uses Simpson's rule on uniform radial grid.
+        'dht': Uses Discrete Hankel Transform (DHT) for radial direction.
 
     Returns
     -------
     coeffs : np.ndarray
         Shape (M+1, K_r, K_z).
     """
+    N_theta = N_theta or disk.min_n_theta(M)
     if N_theta < 2 * M + 1:
         raise ValueError("N_theta must be at least 2M + 1.")
 
-    dz = L / N_z
+    dz = 1 / N_z
     dt = 2 * np.pi / N_theta
 
     m = np.arange(0, M + 1)  # (M+1,)
     l = np.arange(1, K_z + 1)  # (K_z,)  # noqa: E741
-    z = np.linspace(dz / 2, L - dz / 2, N_z)  # (N_z,)
     t = np.linspace(0, 2 * np.pi, N_theta, endpoint=False)  # (N_theta,)
+    z = interval.samples(N_z)  # (N_z,)
 
-    if method == "legendre":
-        r_norm, w_norm, J = get_legendre_basis(M, K_r, N_r)
-        r = R * r_norm  # (N_r,)
-        w = R * w_norm  # (N_r,)
-    elif method == "simpson":
-        r = np.linspace(0, R, N_r)  # (N_r,)
-        J = get_bessel_basis(M, K_r, N_r)  # (M+1, K_r, N_r)
-    else:
-        raise ValueError(f"Unknown method: {method}")
-
-    f = func(r[:, None, None], t[None, :, None], z[None, None, :])  # (N_r, N_theta, N_z)
-
-    # FFT along Theta (axis 1): N_theta -> M+1
     E = np.exp(-1j * m[:, None] * t[None, :])  # (M+1, N_theta)
+    S = np.sin(l[:, None] * np.pi * z[None, :])  # (K_z, N_z)
+    match method:
+        case "legendre":
+            r, w, J = disk.legendre_basis(M, K_r, N_r)  # (N_r,), (N_r,), (M+1, K_r, N_r)
+            f = func(r[:, None, None] * R, t[None, :, None], z[None, None, :] * L)  # (N_r, N_theta, N_z)
+            coeffs = np.einsum("rtz, mt, lz, r, mkr -> mkl", f, E, S, r * w * dt * dz, J, optimize=True)  # (M+1, K_r, K_z)
+        case "simpson":
+            r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
+            f = func(r[:, None, None] * R, t[None, :, None], z[None, None, :] * L)  # (N_r, N_theta, N_z)
+            integrand = np.einsum("rtz, mt, lz, r, mkr -> rmkl", f, E, S, r * dt * dz, J, optimize=True)  # (N_r, M+1, K_r, K_z)
+            coeffs = simpson(integrand, x=r, axis=0)  # (M+1, K_r, K_z)
+        case "dht":
+            r, w, J = disk.dht_basis(M, K_r)  # (M+1, K_r), (M+1, K_r), (M+1, K_r, K_r)
+            f = func(r[:, :, None, None] * R, t[None, None, :, None], z[None, None, None, :] * L)  # (M+1, K_r, N_theta, N_z)
+            coeffs = np.einsum("mrtz, mt, lz, mkr, mr -> mkl", f, E, S, J, w * dt * dz, optimize=True)  # (M+1, K_r, K_z)
+        case _:
+            raise ValueError(f"Unknown method: {method}")
 
-    # DST along Z (axis 2): N_z -> K_z
-    S = np.sin(l[:, None] * np.pi * z[None, :] / L)  # (K_z, N_z)
-
-    # DHT along R (axis 0): N_r -> K_r
-    if method == "legendre":
-        coeffs = np.einsum("rtz, mt, lz, r, mkr -> mkl", f, E, S, r * w * dt * dz, J, optimize=True)  # (M+1, K_r, K_z)
-    else:  # simpson
-        integrand = np.einsum("rtz, mt, lz, r, mkr -> rmkl", f, E, S, r * dt * dz, J, optimize=True)  # (N_r, M+1, K_r, K_z)
-        coeffs = simpson(integrand, x=r, axis=0)  # (M+1, K_r, K_z)
-    coeffs /= get_bessel_norm_factors(M, K_r)[:, :, None] * L / 2 * R**2  # (M+1, K_r, K_z)
+    coeffs /= disk.norm_factors(M, K_r)[:, :, None] / 2  # (M+1, K_r, K_z)
     return coeffs
 
 
@@ -113,60 +110,56 @@ def inverse_transform(coeffs, R, L, N_xy=100, N_z=100):
     """
     M, K_r, K_z = coeffs.shape[0] - 1, coeffs.shape[1], coeffs.shape[2]
     N_r = int(np.hypot(N_xy, N_xy))
-    dz = L / N_z
 
     Ys, Xs = np.mgrid[-R : R : N_xy * 1j, -R : R : N_xy * 1j]  # (N_xy, N_xy)
     Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)  # (N_xy, N_xy)
 
     m = np.arange(0, M + 1)  # (M+1,)
     l = np.arange(1, K_z + 1)  # (K_z,)  # noqa: E741
-    z = np.linspace(dz / 2, L - dz / 2, N_z)  # (N_z,)
-    r = np.linspace(0, R, N_r)  # (N_r,)
+    z = interval.samples(N_z)  # (N_z,)
 
     Xs = np.broadcast_to(Xs[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
     Ys = np.broadcast_to(Ys[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    Zs = np.broadcast_to(z[:, None, None], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
+    Zs = np.broadcast_to(z[:, None, None] * L, (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
 
-    S = np.sin(l[:, None] * np.pi * z[None, :] / L)  # (K_z, N_z)
-    J = get_bessel_basis(M, K_r, N_r)  # (M+1, K_r, N_r)
+    r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
+    S = np.sin(l[:, None] * np.pi * z[None, :])  # (K_z, N_z)
     E = np.exp(1j * m[:, None, None] * Ts[None, :, :])  # (M+1, N_xy, N_xy)
 
     C = np.einsum("mkl, lz, mkr -> mzr", coeffs, S, J)  # (M+1, N_z, N_r)
-    C = interp1d(r, C, axis=-1, bounds_error=False, fill_value=0)(Rs)  # (M+1, N_z, N_xy, N_xy)
-
+    C = interp1d(r * R, C, axis=-1, bounds_error=False, fill_value=0)(Rs)  # (M+1, N_z, N_xy, N_xy)
     f = C[0].real * E[0].real + 2 * np.einsum("mzxy, mxy -> zxy", C[1:], E[1:], optimize=True).real  # (N_z, N_xy, N_xy)
 
     return Xs, Ys, Zs, f
 
 
 def transform_fast(func, R, L, M, K_r, K_z, N_r=60, N_theta=200, N_z=60, method: Literal["legendre", "simpson"] = "legendre"):
+    N_theta = N_theta or disk.min_n_theta(M)
     if N_theta < 2 * M + 1:
         raise ValueError("N_theta must be at least 2M + 1.")
 
     dz = L / N_z
     dt = 2 * np.pi / N_theta
 
-    z = np.linspace(dz / 2, L - dz / 2, N_z)  # (N_z,)
     t = np.linspace(0, 2 * np.pi, N_theta, endpoint=False)  # (N_theta,)
+    z = interval.samples(N_z)  # (N_z,)
 
-    if method == "legendre":
-        r, w, J = get_legendre_basis(M, K_r, N_r)
-        r = R * r  # (N_r,)
-        w = R * w  # (N_r,)
-    elif method == "simpson":
-        r = np.linspace(0, R, N_r)  # (N_r,)
-        J = get_bessel_basis(M, K_r, N_r)  # (M+1, K_r, N_r)
-    else:
-        raise ValueError(f"Unknown method: {method}")
+    match method:
+        case "legendre":
+            r, w, J = disk.legendre_basis(M, K_r, N_r)
+        case "simpson":
+            r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
+        case _:
+            raise ValueError(f"Unknown method: {method}")
 
-    f = func(r[:, None, None], t[None, :, None], z[None, None, :])  # (N_r, N_theta, N_z)
+    f = func(r[:, None, None] * R, t[None, :, None], z[None, None, :] * L)  # (N_r, N_theta, N_z)
 
     # RFFT along Theta (axis 1): N_theta -> M+1
-    F: np.ndarray = scipy.fft.rfft(f, axis=1) * dt  # (N_r, N_theta//2+1, N_z) # type: ignore
+    F: np.ndarray = scipy.fft.rfft(f, axis=1, overwrite_x=True) * dt  # (N_r, N_theta//2+1, N_z) # type: ignore
     F = F[:, : M + 1, :]  # (N_r, M+1, N_z)
 
     # DST along Z (axis 2): N_z -> K_z
-    F = scipy.fft.dst(F, axis=2) * dz  # (N_r, M+1, K_z)
+    F = scipy.fft.dst(F, axis=2, overwrite_x=True) * dz  # (N_r, M+1, K_z)
     F = F[:, :, :K_z]  # (N_r, M+1, K_z)
 
     # DHT along R (axis 0): N_r -> K_r
@@ -175,29 +168,27 @@ def transform_fast(func, R, L, M, K_r, K_z, N_r=60, N_theta=200, N_z=60, method:
     else:  # simpson
         integrand = np.einsum("rml, r, mkr -> rmkl", F, r, J, optimize=True)  # (N_r, M+1, K_r, K_z)
         coeffs = simpson(integrand, x=r, axis=0)  # (M+1, K_r, K_z)
-    coeffs /= get_bessel_norm_factors(M, K_r)[:, :, None] * L * R**2  # (M+1, K_r, K_z)
+    coeffs /= disk.norm_factors(M, K_r)[:, :, None] * L  # (M+1, K_r, K_z)
     return coeffs
 
 
-def inverse_transform_fast(coeffs, R, L, N_xy=100, N_z=100, N_r=None, N_theta=None):
+def inverse_transform_fast(coeffs, R, L, N_xy=100, N_z=100, N_r=None):
     M, K_r, K_z = coeffs.shape[0] - 1, coeffs.shape[1], coeffs.shape[2]  # noqa: F841
     N_r = N_r or int(np.hypot(N_xy, N_xy))
-    N_theta = N_theta or int(2 * np.pi * N_xy)
+    N_theta: int = scipy.fft.next_fast_len(int(2 * np.pi * N_r))  # type: ignore
 
-    dz = L / N_z
     t = np.linspace(0, 2 * np.pi, N_theta + 1)  # (N_theta+1,)
-    r = np.linspace(0, R, N_r)  # (N_r,)
-    z = np.linspace(dz / 2, L - dz / 2, N_z)  # (N_z,)
+    z = interval.samples(N_z)  # (N_z,)
 
     # IDST along Z (axis 2): K_z -> N_z
-    C = scipy.fft.idst(coeffs * N_z, axis=2, n=N_z)  # (M+1, K_r, N_z) # type: ignore
+    C = scipy.fft.idst(coeffs * N_z, axis=2, n=N_z, overwrite_x=True)  # (M+1, K_r, N_z) # type: ignore
 
     # IDHT along R (axis 1): K_r -> N_r
-    J = get_bessel_basis(M, K_r, N_r)  # (M+1, K_r, N_r)
+    r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
     C: np.ndarray = np.einsum("mkz, mkr -> mrz", C, J)  # (M+1, N_r, N_z)
 
     # IRFFT along Theta (axis 0): M+1 -> N_theta using IRFFT
-    f: np.ndarray = scipy.fft.irfft(C, n=N_theta, axis=0) * N_theta  # (N_theta, N_r, N_z) # type: ignore
+    f: np.ndarray = scipy.fft.irfft(C, n=N_theta, axis=0, overwrite_x=True) * N_theta  # (N_theta, N_r, N_z) # type: ignore
     f = np.pad(f, ((0, 1), (0, 0), (0, 0)), mode="wrap")  # (N_theta+1, N_r, N_z)
 
     # Interpolate Cylindrical -> Cartesian
@@ -205,11 +196,11 @@ def inverse_transform_fast(coeffs, R, L, N_xy=100, N_z=100, N_r=None, N_theta=No
     Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)  # (N_xy, N_xy)
     Xs = np.broadcast_to(Xs[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
     Ys = np.broadcast_to(Ys[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    Zs = np.broadcast_to(z[:, None, None], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
+    Zs = np.broadcast_to(z[:, None, None] * L, (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
     Ts = np.broadcast_to(Ts[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
     Rs = np.broadcast_to(Rs[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
     grid = np.stack([np.mod(Ts, 2 * np.pi), Rs, Zs], axis=-1)  # (N_z, N_xy, N_xy, 3)
-    f = RegularGridInterpolator((t, r, z), f, bounds_error=False, fill_value=0)(grid)  # (N_z, N_xy, N_xy)
+    f = RegularGridInterpolator((t, r * R, z * L), f, bounds_error=False, fill_value=0)(grid)  # (N_z, N_xy, N_xy)
 
     return Xs, Ys, Zs, f
 
