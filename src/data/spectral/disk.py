@@ -251,61 +251,191 @@ def inverse_transform_fast(coeffs, R, N=256, N_theta=None) -> tuple[np.ndarray, 
     return Xs, Ys, f
 
 
+def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, lr=1e-2, epochs=200, verbose=False, device=None):
+    """
+    Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing (e.g. clipping).
+    Uses gradient descent to optimize coefficients to minimize MSE after activation.
+
+    Parameters
+    ----------
+    func : callable
+        Function f(r, theta).
+    R : float
+        Disk radius.
+    M : int
+        Max angular order.
+    K : int
+        Number of radial modes.
+    N_r, N_theta : int
+        Grid size for sampling.
+    activation : callable, optional
+        Function to apply to the reconstructed values before loss calculation.
+        Useful for handling clipping or other non-linearities.
+    reg : callable, optional
+        Regularization function on coefficients. Default is no regularization.
+    lr : float
+        Learning rate.
+    epochs : int
+        Number of optimization steps.
+
+    Returns
+    -------
+    coeffs : np.ndarray
+        Optimized coefficients (M+1, K).
+    """
+    import torch
+
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    N_theta = N_theta or min_n_theta(M)
+
+    # Sample on grid
+    m = np.arange(0, M + 1)  # (M+1,)
+    r, _, J = legendre_basis(M, K, N_r)  # (N_r,), (N_r,), (M+1, K, N_r)
+    t = np.linspace(0, 2 * np.pi, N_theta, endpoint=False)
+
+    # Target values
+    f_true = func(r[:, None] * R, t[None, :])  # (N_r, N_theta)
+
+    E = np.exp(1j * t[:, None] * m[None, :])  # (N_theta, M+1)
+    w = np.r_[1, [2] * M]
+
+    init_coeffs = transform(func, R, M, K, N_r, N_theta, method="legendre")
+    coeffs = torch.tensor(init_coeffs, dtype=torch.complex64, device=device, requires_grad=True)
+
+    J = torch.from_numpy(J).to(device=device, dtype=torch.complex64)
+    E = torch.from_numpy(E).to(device=device, dtype=torch.complex64)
+    w = torch.from_numpy(w).to(device=device, dtype=torch.complex64)
+    f_true = torch.from_numpy(f_true).to(device=device, dtype=torch.float32)
+
+    def loss_fn(f):
+        return torch.nn.functional.mse_loss(f, f_true)
+
+    optimizer = torch.optim.Adam([coeffs], lr=lr)
+
+    for i in range(epochs):
+        optimizer.zero_grad()
+
+        f = torch.einsum("mk, mkr, tm, m -> rt", coeffs, J, E, w).real
+
+        if activation:
+            f = activation(f)
+
+        loss = loss_fn(f)
+        if reg:
+            loss = loss + reg(coeffs)
+
+        loss.backward()
+        optimizer.step()
+
+        if verbose and i % 10 == 0:
+            print(f"Iter {i}: Loss {loss.item():.6e}")
+
+    return coeffs.detach().cpu().numpy()
+
+
 if __name__ == "__main__":
+    import torch
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
-    def example_func(r, theta):
+    def latent_func(r, theta):
         x = r * np.cos(theta)
         y = r * np.sin(theta)
-        z1 = np.exp(-((x - 80) ** 2 + y**2) / (2 * 40**2))
-        z2 = -0.8 * np.exp(-((x + 80) ** 2 + (y - 50) ** 2) / (2 * 30**2))
+        z1 = 2.0 * np.exp(-((x - 80) ** 2 + y**2) / (2 * 100**2))
+        z2 = -8.0 * np.exp(-((x + 80) ** 2 + (y - 50) ** 2) / (2 * 100**2))
         return (z1 + z2) * soft_mask(r, R=R)
 
+    CLIP_MIN, CLIP_MAX = -2, None
+
+    def observed_func(r, theta):
+        return np.clip(latent_func(r, theta), CLIP_MIN, CLIP_MAX)
+
     R = 256
-    M = 20  # angular orders
-    K = 10  # radial modes
-    N_R = 200
+    M = 8
+    K = 8
+    N_R = 100
+    N_XY = 200
 
-    # Transform (Normal vs Fast)
-    coeffs_normal = transform(example_func, R=R, M=M, K=K, N_r=N_R)
-    coeffs_fast = transform_fast(example_func, R=R, M=M, K=K, N_r=N_R)
-    print(f"Transform Diff (Normal vs Fast): {np.max(np.abs(coeffs_normal - coeffs_fast)):.6e}")
+    print("=" * 58)
+    print(f"Disk Spec. Decomp. (R={R}, M={M}, K={K})")
 
-    # Reconstruct (Inverse vs Inverse Fast)
-    X, Y, Z_rec = inverse_transform(coeffs_normal, R=R, N=N_R)
-    _, _, Z_rec_fast = inverse_transform_fast(coeffs_normal, R=R, N=N_R)
-    print(f"Reconstruction Diff (Regular vs Fast): {np.nanmax(np.abs(Z_rec - Z_rec_fast)):.6e}")
+    # Transform and Reconstruction
+    c_dir = transform(observed_func, R, M, K, N_r=N_R)
+    c_fit = fit(observed_func, R, M, K, N_r=N_R, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), lr=0.01, epochs=200)
+    c_fast = transform_fast(observed_func, R, M, K, N_r=N_R)
+    Xs, Ys, f_rec = inverse_transform(c_dir, R, N=N_XY)
+    Xs, Ys, f_fast = inverse_transform_fast(c_dir, R, N=N_XY)
+    Xs, Ys, f_fit = inverse_transform(c_fit, R, N=N_XY)
+    f_fit = np.clip(f_fit, CLIP_MIN, CLIP_MAX)
+    Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)
+    f_lat = latent_func(Rs, Ts) * (Rs <= R)
+    f_obs = observed_func(Rs, Ts) * (Rs <= R)
 
-    # Get ground truth
-    R_grid = np.sqrt(X**2 + Y**2)
-    T_grid = np.arctan2(Y, X)
-    Z_true = example_func(R_grid, T_grid)
-    Z_true[R_grid > R] = np.nan
-    Z_rec[R_grid > R] = np.nan
+    def stats(name, d):
+        print(f"{name:<25} | MaxAbs: {np.max(d):.1e} | MSE: {np.mean(d**2):.1e}")
 
-    # Display errors
-    print("\nError vs Ground Truth:")
-    print(f"MAE: {np.nanmax(np.abs(Z_true - Z_rec)):.6e}")
-    print(f"RMSE: {np.sqrt(np.nanmean((Z_true - Z_rec) ** 2)):.6e}")
+    print("-" * 58)
+    stats("Transform Diff (Fast-Std)", np.abs(c_dir - c_fast))
+    stats("InvTrans Diff (Fast-Std)", np.abs(f_rec - f_fast))
+    print("-" * 58)
+    stats("Observed vs Direct", np.abs(f_obs - f_rec))
+    stats("Observed vs Fitted", np.abs(f_obs - f_fit))
+    print("-" * 58)
 
     # Visualization
     fig = make_subplots(
-        rows=1,
+        rows=2,
         cols=3,
-        specs=[[{"type": "surface"}, {"type": "surface"}, {"type": "surface"}]],
-        subplot_titles=("Original", f"Reconstructed (M={M}, K={K})", "Absolute Error"),
+        subplot_titles=(
+            "Observed (Clipped)",
+            "Direct Recon",
+            "Fitted Recon",
+            "Latent Truth",
+            "Direct Error",
+            "Fitted Error",
+        ),
+        specs=[[{"type": "surface"}] * 3] * 2,
+        vertical_spacing=0.03,
+        horizontal_spacing=0.03,
     )
-    fig.add_trace(go.Surface(x=X, y=Y, z=Z_true, colorscale="Viridis", showscale=False), row=1, col=1)
-    fig.add_trace(go.Surface(x=X, y=Y, z=Z_rec, colorscale="Viridis", showscale=False), row=1, col=2)
-    fig.add_trace(go.Surface(x=X, y=Y, z=np.abs(Z_true - Z_rec), colorscale="Plasma", showscale=True), row=1, col=3)
 
-    scene_config = dict(aspectratio=dict(x=1, y=1, z=0.5))
+    def add_surf(r, c, vol, imin, imax, cmap="Plotly3", showscale=False):
+        fig.add_trace(
+            go.Surface(
+                x=Xs,
+                y=Ys,
+                z=vol,
+                cmin=imin,
+                cmax=imax,
+                colorscale=cmap,
+                showscale=showscale,
+            ),
+            row=r,
+            col=c,
+        )
+
+    fs = [f_obs, f_rec, f_fit, f_lat]
+    v_min, v_max = min(f.min() for f in fs), max(f.max() for f in fs)
+    max_err = np.abs(f_rec - f_obs).max()
+
+    add_surf(1, 1, f_obs, v_min, v_max)
+    add_surf(1, 2, f_rec, v_min, v_max)
+    add_surf(1, 3, f_fit, v_min, v_max)
+    add_surf(2, 1, f_lat, v_min, v_max)
+    add_surf(2, 2, np.abs(f_rec - f_obs), 0, max_err, "Hot")
+    add_surf(2, 3, np.abs(f_fit - f_obs), 0, max_err, "Hot")
+
+    scene_common = dict(zaxis=dict(range=[v_min, v_max]))
+    scene_err = dict(zaxis=dict(range=[0, max_err]))
     fig.update_layout(
-        title_text="Fourier-Bessel Spectral Decomposition on Disk",
+        title="Disk Clipped Reconstruction Benchmark",
         template="plotly_dark",
-        scene=scene_config,
-        scene2=scene_config,
-        scene3=scene_config,
+        margin=dict(l=10, r=10, t=30, b=10),
+        scene=scene_common,
+        scene2=scene_common,
+        scene3=scene_common,
+        scene4=scene_common,
+        scene5=scene_err,
+        scene6=scene_err,
     )
-    fig.write_html("fourier_bessel_decomposition.html", include_plotlyjs="cdn")
+    fig.write_html("disk_decomposition.html", include_plotlyjs="cdn")
