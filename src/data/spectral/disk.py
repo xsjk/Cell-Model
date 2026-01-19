@@ -4,6 +4,7 @@ from typing import Literal
 import numpy as np
 import scipy.fft
 import scipy.special as sp
+import torch
 from scipy.integrate import simpson
 from scipy.interpolate import RegularGridInterpolator, interp1d
 
@@ -226,10 +227,10 @@ def transform_fast(func, R, M, K, N_r=200, N_theta=None, method: Literal["legend
     return coeffs
 
 
-def inverse_transform_fast(coeffs, R, N=256, N_theta=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def inverse_transform_fast(coeffs, R, N=256, N_r=None, N_theta=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     M, K = coeffs.shape[0] - 1, coeffs.shape[1]
-    N_r = int(np.hypot(N, N))
-    N_theta = N_theta or scipy.fft.next_fast_len(int(2 * np.pi * N))  # type: ignore
+    N_r = N_r or int(np.hypot(N, N))
+    N_theta = N_theta or scipy.fft.next_fast_len(int(2 * np.pi * N_r))  # type: ignore
     assert isinstance(N_theta, int)
 
     t = np.linspace(0, 2 * np.pi, N_theta + 1)  # (N_theta+1,)
@@ -251,98 +252,127 @@ def inverse_transform_fast(coeffs, R, N=256, N_theta=None) -> tuple[np.ndarray, 
     return Xs, Ys, f
 
 
-def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, init_coeffs=None, lr=1e-2, criterion=None, epochs=200, verbose=False, device=None):
-    """
-    Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing (e.g. clipping).
-    Uses gradient descent to optimize coefficients to minimize MSE after activation.
-
-    Parameters
-    ----------
-    func : callable
-        Function f(r, theta).
-    R : float
-        Disk radius.
-    M : int
-        Max angular order.
-    K : int
-        Number of radial modes.
-    N_r, N_theta : int
-        Grid size for sampling.
-    activation : callable, optional
-        Function to apply to the reconstructed values before loss calculation.
-        Useful for handling clipping or other non-linearities.
-    reg : callable, optional
-        Regularization function on coefficients. Default is no regularization.
-    init_coeffs : np.ndarray, optional
-        Initial coefficients for optimization. If None, uses direct transform.
-    lr : float
-        Learning rate.
-    criterion: callable, optional
-        Loss function (pred, target). Default is MSE.
-    epochs : int
-        Number of optimization steps.
-    verbose : bool
-        Whether to print progress.
-    device : str, optional
-        Device for computation ('cpu' or 'cuda'). Defaults to 'cuda' if available.
-
-    Returns
-    -------
-    coeffs : np.ndarray
-        Optimized coefficients (M+1, K).
-    """
-    import torch
-
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+def transform_torch(data, M, K, N_r=None, N_theta=None, method: Literal["legendre", "simpson"] = "simpson"):
+    assert data.ndim == 2 and data.shape[0] == data.shape[1]
+    device, dtype = data.device, data.dtype
+    cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
+    N = data.shape[0]
+    N_r = N_r or N // 2
     N_theta = N_theta or min_n_theta(M)
 
-    # Sample on grid
-    m = np.arange(0, M + 1)  # (M+1,)
-    r, _, J = legendre_basis(M, K, N_r)  # (N_r,), (N_r,), (M+1, K, N_r)
-    t = np.linspace(0, 2 * np.pi, N_theta, endpoint=False)
+    # Coordinates & Weights
+    match method:
+        case "legendre":
+            r, w, J = legendre_basis(M, K, N_r)
+            r = torch.from_numpy(r).to(device, dtype)
+            w = torch.from_numpy(w).to(device, dtype)
+        case "simpson":
+            # Simpson's Rule weights: 1-4-2-4-2...4-1 on uniform grid [0, 1]
+            r, J = bessel_basis(M, K, N_r)
+            r = torch.from_numpy(r).to(device, dtype)
+            w = torch.ones(N_r, device=device, dtype=dtype)
+            w[1:-1:2], w[2:-1:2] = 4, 2
+            w *= (1.0 / (N_r - 1)) / 3.0
+        case _:
+            raise ValueError(f"Unknown method: {method}")
+    J = torch.from_numpy(J).to(device, cdtype)  # (M+1, K, N_r)
 
-    # Target values
-    f_true = func(r[:, None] * R, t[None, :])  # (N_r, N_theta)
+    # Resample Cartesian -> Polar
+    t = torch.linspace(0, 2 * torch.pi, N_theta + 1, device=device, dtype=dtype)[:-1]
+    grid = torch.empty((1, N_r, N_theta, 2), device=device, dtype=dtype)
+    grid[0, ..., 0] = r[:, None] * torch.cos(t[None, :])
+    grid[0, ..., 1] = r[:, None] * torch.sin(t[None, :])
+    f = torch.nn.functional.grid_sample(data[None, None, ...], grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
 
-    E = np.exp(1j * t[:, None] * m[None, :])  # (N_theta, M+1)
-    w = np.r_[1, [2] * M]
+    # Spectral Projections (FFT, Bessel)
+    F = torch.fft.rfft(f, dim=1)[:, : M + 1] * (2 * torch.pi / N_theta)  # (N_r, M+1)
+    coeffs = torch.einsum("rm, r, r, mkr -> mk", F, r, w, J)  # (M+1, K)
+
+    # Normalization
+    norms = torch.from_numpy(norm_factors(M, K)).to(device, cdtype)
+    return coeffs / norms
+
+
+def inverse_transform_torch(coeffs, N, N_r=None, N_theta=None):
+    assert coeffs.ndim == 2
+    device, cdtype = coeffs.device, coeffs.dtype
+    dtype = torch.float64 if cdtype == torch.complex128 else torch.float32
+
+    M, K = coeffs.shape[0] - 1, coeffs.shape[1]
+    N_r = N_r or int(np.hypot(N, N))
+    N_theta = N_theta or int(scipy.fft.next_fast_len(int(2 * np.pi * N_r)))  # type: ignore
+
+    _, J = bessel_basis(M, K, N_r)  # (N_r,), (M+1, K, N_r)
+    J = torch.from_numpy(J).to(device=device, dtype=cdtype)  # (M+1, K, N_r)
+
+    # Project to Polar Grid
+    C = torch.einsum("mk, mkr -> mr", coeffs, J)  # (M+1, N_r)
+    f = torch.fft.irfft(C, n=N_theta, dim=0) * N_theta  # (N_theta, N_r)
+    f = torch.cat([f, f[:1, :]], dim=0)  # (N_theta+1, N_r)
+
+    # Coordinate Mapping (Normalized)
+    Y, X = torch.meshgrid(*[torch.linspace(-1, 1, N, device=device, dtype=dtype)] * 2, indexing="ij")
+    Rs, Ts = torch.hypot(X, Y), torch.atan2(Y, X) % (2 * torch.pi)
+
+    grid = torch.empty((1, N, N, 2), device=device, dtype=dtype)
+    grid[0, ..., 0] = Rs * 2 - 1
+    grid[0, ..., 1] = (Ts / (2 * torch.pi)) * 2 - 1
+
+    return torch.nn.functional.grid_sample(f[None, None, ...], grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0, ...]
+
+
+def fit(data, M, K, N_r=None, N_theta=None, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion=None, epochs=1000, log_interval=None, device=None):
+    """
+    Fit spectral coefficients to a 2D data grid using gradient descent.
+    """
+    assert data.ndim == 2 and data.shape[0] == data.shape[1]
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(data, np.ndarray):
+        data = torch.from_numpy(data).to(device=device)
+    else:
+        data = data.detach().to(device=device)
+    data = data.detach()
+    dtype, N = data.dtype, data.shape[0]
+    cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
 
     if init_coeffs is None:
-        init_coeffs = transform(func, R, M, K, N_r, N_theta, method="legendre")
-    coeffs = torch.tensor(init_coeffs, dtype=torch.complex64, device=device, requires_grad=True)
-
-    J = torch.from_numpy(J).to(device=device, dtype=torch.complex64)
-    E = torch.from_numpy(E).to(device=device, dtype=torch.complex64)
-    w = torch.from_numpy(w).to(device=device, dtype=torch.complex64)
-    f_true = torch.from_numpy(f_true).to(device=device, dtype=torch.float32)
+        coeffs = transform_torch(data, M, K, N_r=N_r, N_theta=N_theta).requires_grad_(True)
+    else:
+        coeffs = torch.tensor(init_coeffs, dtype=cdtype, device=device, requires_grad=True)
 
     criterion = criterion or torch.nn.functional.mse_loss
     optimizer = torch.optim.Adam([coeffs], lr=lr)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=epochs)
 
     for i in range(epochs):
         optimizer.zero_grad()
-
-        f = torch.einsum("mk, mkr, tm, m -> rt", coeffs, J, E, w).real
-
+        f = inverse_transform_torch(coeffs, N, N_r=N_r, N_theta=N_theta)
         if activation:
             f = activation(f)
 
-        loss = criterion(f, f_true)
+        loss = criterion(f, data)
         if reg:
             loss = loss + reg(coeffs)
 
         loss.backward()
         optimizer.step()
+        if scheduler:
+            scheduler.step()
 
-        if verbose and i % 10 == 0:
-            print(f"Iter {i}: Loss {loss.item():.6e}")
+        if log_interval is not None and i % log_interval == 0:
+            print(f"Fit Iter {i}: Loss {loss.item():.6e}")
 
-    return coeffs.detach().cpu().numpy()
+    with torch.inference_mode():
+        f = inverse_transform_torch(coeffs, N, N_r=N_r, N_theta=N_theta)
+        if activation:
+            f = activation(f)
+
+    return coeffs.detach().cpu().numpy(), f.detach().cpu().numpy()
 
 
 if __name__ == "__main__":
-    import torch
     import plotly.graph_objects as go
+    import torch
     from plotly.subplots import make_subplots
 
     def latent_func(r, theta):
@@ -366,17 +396,26 @@ if __name__ == "__main__":
     print("=" * 58)
     print(f"Disk Spec. Decomp. (R={R}, M={M}, K={K})")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # Transform and Reconstruction
     c_dir = transform(observed_func, R, M, K, N_r=N_R)
-    c_fit = fit(observed_func, R, M, K, N_r=N_R, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), init_coeffs=c_dir, lr=0.01, epochs=200)
     c_fast = transform_fast(observed_func, R, M, K, N_r=N_R)
     Xs, Ys, f_rec = inverse_transform(c_dir, R, N=N_XY)
     Xs, Ys, f_fast = inverse_transform_fast(c_dir, R, N=N_XY)
-    Xs, Ys, f_fit = inverse_transform(c_fit, R, N=N_XY)
-    f_fit = np.clip(f_fit, CLIP_MIN, CLIP_MAX)
+    f_torch = inverse_transform_torch(torch.from_numpy(c_dir).to(device), N_XY).cpu().numpy()
+    np.testing.assert_allclose(f_torch, f_fast, atol=1e-14)
+
     Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)
     f_lat = latent_func(Rs, Ts) * (Rs <= R)
     f_obs = observed_func(Rs, Ts) * (Rs <= R)
+
+    print("Fitting...")
+    activation = lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX)  # noqa: E731
+    c_fit, f_fit_torch = fit(f_obs, M, K, N_r=N_R, activation=activation, init_coeffs=c_dir, log_interval=100)
+    Xs, Ys, f_fit_raw = inverse_transform_fast(c_fit, R, N=N_XY, N_r=N_R)
+    f_fit = np.clip(f_fit_raw, CLIP_MIN, CLIP_MAX)
+    np.testing.assert_allclose(f_fit_torch, f_fit, atol=1e-14)
 
     def stats(name, d):
         print(f"{name:<25} | MaxAbs: {np.max(d):.1e} | MSE: {np.mean(d**2):.1e}")
@@ -386,7 +425,7 @@ if __name__ == "__main__":
     stats("InvTrans Diff (Fast-Std)", np.abs(f_rec - f_fast))
     print("-" * 58)
     stats("Observed vs Direct", np.abs(f_obs - f_rec))
-    stats("Observed vs Fitted", np.abs(f_obs - f_fit))
+    stats("Observed vs Fitted", np.abs(f_obs - f_fit_torch))
     print("-" * 58)
 
     # Visualization

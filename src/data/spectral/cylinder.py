@@ -2,6 +2,7 @@ from typing import Literal
 
 import numpy as np
 import scipy.fft
+import torch
 from scipy.integrate import simpson
 from scipy.interpolate import RegularGridInterpolator, interp1d
 
@@ -158,170 +159,180 @@ def inverse_transform(coeffs, R, L, N_xy=100, N_z=100):
 
 def transform_fast(func, R, L, M, K_r, K_z, N_r=60, N_theta=200, N_z=60, method: Literal["legendre", "simpson"] = "legendre"):
     N_theta = N_theta or disk.min_n_theta(M)
-    if N_theta < 2 * M + 1:
-        raise ValueError("N_theta must be at least 2M + 1.")
-
-    dz = L / N_z
-    dt = 2 * np.pi / N_theta
-
+    dz, dt = L / N_z, 2 * np.pi / N_theta
     t = np.linspace(0, 2 * np.pi, N_theta, endpoint=False)  # (N_theta,)
     z = interval.samples(N_z)  # (N_z,)
 
-    match method:
-        case "legendre":
-            r, w, J = disk.legendre_basis(M, K_r, N_r)
-        case "simpson":
-            r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
-        case _:
-            raise ValueError(f"Unknown method: {method}")
+    if method == "legendre":
+        r, w, J = disk.legendre_basis(M, K_r, N_r)
+    else:
+        r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
 
     f = func(r[:, None, None] * R, t[None, :, None], z[None, None, :] * L)  # (N_r, N_theta, N_z)
 
-    # RFFT along Theta (axis 1): N_theta -> M+1
-    F: np.ndarray = scipy.fft.rfft(f, axis=1, overwrite_x=True) * dt  # (N_r, N_theta//2+1, N_z) # type: ignore
-    F = F[:, : M + 1, :]  # (N_r, M+1, N_z)
+    # Fast Spectral Projection (FFT, DST, Bessel)
+    F = scipy.fft.rfft(f, axis=1)[:, : M + 1, :] * dt  # (N_r, M+1, N_z) # type: ignore[no-untyped-call]
+    F = scipy.fft.dst(F, axis=2)[:, :, :K_z] * dz  # (N_r, M+1, K_z) # type: ignore[no-untyped-call]
 
-    # DST along Z (axis 2): N_z -> K_z
-    F = scipy.fft.dst(F, axis=2, overwrite_x=True) * dz  # (N_r, M+1, K_z)
-    F = F[:, :, :K_z]  # (N_r, M+1, K_z)
-
-    # DHT along R (axis 0): N_r -> K_r
     if method == "legendre":
-        coeffs = np.einsum("rml, r, r, mkr -> mkl", F, r, w, J, optimize=True)  # (M+1, K_r, K_z)
-    else:  # simpson
-        integrand = np.einsum("rml, r, mkr -> rmkl", F, r, J, optimize=True)  # (N_r, M+1, K_r, K_z)
-        coeffs = simpson(integrand, x=r, axis=0)  # (M+1, K_r, K_z)
-    coeffs /= disk.norm_factors(M, K_r)[:, :, None] * L  # (M+1, K_r, K_z)
-    return coeffs
+        coeffs = np.einsum("rml, r, r, mkr -> mkl", F, r, w, J)
+    else:
+        coeffs = simpson(np.einsum("rml, r, mkr -> rmkl", F, r, J), x=r, axis=0)
+
+    norms = L * disk.norm_factors(M, K_r)  # (M+1, K_r)
+    return coeffs / norms[:, :, None]
 
 
 def inverse_transform_fast(coeffs, R, L, N_xy=100, N_z=100, N_r=None, N_theta=None):
     M, K_r, K_z = coeffs.shape[0] - 1, coeffs.shape[1], coeffs.shape[2]  # noqa: F841
     N_r = N_r or int(np.hypot(N_xy, N_xy))
-    N_theta = N_theta or scipy.fft.next_fast_len(int(2 * np.pi * N_r))  # type: ignore
-    assert isinstance(N_theta, int)
+    N_theta = N_theta or int(scipy.fft.next_fast_len(int(2 * np.pi * N_r)))  # type: ignore
 
     t = np.linspace(0, 2 * np.pi, N_theta + 1)  # (N_theta+1,)
+    r = np.linspace(0, 1, N_r)
     z = interval.samples(N_z)  # (N_z,)
 
-    # IDST along Z (axis 2): K_z -> N_z
-    C = scipy.fft.idst(coeffs * N_z, axis=2, n=N_z, overwrite_x=True)  # (M+1, K_r, N_z) # type: ignore
-
-    # IDHT along R (axis 1): K_r -> N_r
-    r, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
-    C: np.ndarray = np.einsum("mkz, mkr -> mrz", C, J)  # (M+1, N_r, N_z)
-
-    # IRFFT along Theta (axis 0): M+1 -> N_theta using IRFFT
-    f: np.ndarray = scipy.fft.irfft(C, n=N_theta, axis=0, overwrite_x=True) * N_theta  # (N_theta, N_r, N_z) # type: ignore
+    # Fast Inverse Projection (IDST, Bessel, IRFFT)
+    C: np.ndarray = scipy.fft.idst(coeffs * N_z, axis=2, n=N_z)  # (M+1, K_r, N_z) # type: ignore[no-untyped-call]
+    _, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
+    C = np.einsum("mkz, mkr -> mrz", C, J)  # (M+1, N_r, N_z)
+    f: np.ndarray = scipy.fft.irfft(C, n=N_theta, axis=0) * N_theta  # (N_theta, N_r, N_z) # type: ignore[no-untyped-call]
     f = np.pad(f, ((0, 1), (0, 0), (0, 0)), mode="wrap")  # (N_theta+1, N_r, N_z)
 
-    # Interpolate Cylindrical -> Cartesian
+    # Interpolate to Cartesian
     Ys, Xs = np.mgrid[-R : R : N_xy * 1j, -R : R : N_xy * 1j]  # (N_xy, N_xy)
-    Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)  # (N_xy, N_xy)
-    Xs = np.broadcast_to(Xs[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    Ys = np.broadcast_to(Ys[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    Zs = np.broadcast_to(z[:, None, None] * L, (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    Ts = np.broadcast_to(Ts[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    Rs = np.broadcast_to(Rs[None, ...], (N_z, N_xy, N_xy))  # (N_z, N_xy, N_xy)
-    grid = np.stack([np.mod(Ts, 2 * np.pi), Rs, Zs], axis=-1)  # (N_z, N_xy, N_xy, 3)
-    f = RegularGridInterpolator((t, r * R, z * L), f, bounds_error=False, fill_value=0)(grid)  # (N_z, N_xy, N_xy)
-
+    Rs, Ts = np.hypot(Xs, Ys), np.mod(np.arctan2(Ys, Xs), 2 * np.pi)  # (N_xy, N_xy)
+    Zs, Rs, Ts = np.broadcast_arrays(z[:, None, None] * L, Rs[None, ...], Ts[None, ...])
+    grid = np.stack([Ts, Rs, Zs], axis=-1)  # (N_z, N_xy, N_xy, 3)
+    f = RegularGridInterpolator((t, r * R, z * L), f, bounds_error=False, fill_value=0)(grid)
     return Xs, Ys, Zs, f
 
 
-def fit(func, R, L, M, K_r, K_z, N_r=60, N_theta=None, N_z=60, activation=None, reg=None, init_coeffs=None, lr=1e-2, criterion=None, epochs=200, verbose=False, device=None):
-    """
-    Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing (e.g. clipping).
-    Uses gradient descent to optimize coefficients to minimize MSE after activation.
-
-    Parameters
-    ----------
-    func : callable
-        Function f(r, theta, z).
-    R, L : float
-        Cylinder dimensions.
-    M : int
-        Max angular order.
-    K_r, K_z : int
-        Number of modes.
-    N_r, N_theta, N_z : int
-        Grid size for sampling.
-    activation : callable, optional
-        Function to apply to the reconstructed values before loss calculation.
-        Useful for handling clipping or other non-linearities.
-    reg : callable, optional
-        Regularization function on coefficients. Default is no regularization.
-    init_coeffs : np.ndarray, optional
-        Initial coefficients for optimization. If None, uses direct transform.
-    lr : float
-        Learning rate.
-    criterion: callable, optional
-        Loss function (pred, target). Default is MSE.
-    epochs : int
-        Number of optimization steps.
-    verbose : bool
-        Whether to print progress.
-    device : str, optional
-        Device for computation ('cpu' or 'cuda'). Defaults to 'cuda' if available.
-
-    Returns
-    -------
-    coeffs : np.ndarray
-        Optimized coefficients (M+1, K_r, K_z).
-    """
-    import torch
-
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-
+def transform_torch(data, M, K_r, K_z, N_r=None, N_theta=None, method: Literal["legendre", "simpson"] = "legendre"):
+    assert data.ndim == 3 and data.shape[1] == data.shape[2]
+    device, dtype = data.device, data.dtype
+    cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
+    N_z, N_xy, _ = data.shape
+    N_r = N_r or N_xy // 2
     N_theta = N_theta or disk.min_n_theta(M)
 
-    # Sample on grid
-    m = np.arange(0, M + 1)  # (M+1,)
-    l = np.arange(1, K_z + 1)  # (K_z,)  # noqa: E741
-    r, _, J = disk.legendre_basis(M, K_r, N_r)  # (N_r,), (N_r,), (M+1, K_r, N_r)
-    t = np.linspace(0, 2 * np.pi, N_theta, endpoint=False)
-    z = interval.samples(N_z)
+    # Coordinates & Weights
+    match method:
+        case "legendre":
+            r, w, J = disk.legendre_basis(M, K_r, N_r)
+            r = torch.from_numpy(r).to(device, dtype)
+            w = torch.from_numpy(w).to(device, dtype)
+        case "simpson":
+            # Simpson's Rule weights: 1-4-2-4-2...4-1 on uniform grid [0, 1]
+            r, J = disk.bessel_basis(M, K_r, N_r)
+            r = torch.from_numpy(r).to(device, dtype)
+            w = torch.ones(N_r, device=device, dtype=dtype)
+            w[1:-1:2], w[2:-1:2] = 4, 2
+            w *= (1.0 / (N_r - 1)) / 3.0
+        case _:
+            raise ValueError(f"Unknown method: {method}")
+    J = torch.from_numpy(J).to(device, cdtype)  # (M+1, K_r, N_r)
 
-    # Target values
-    f_true = func(r[:, None, None] * R, t[None, :, None], z[None, None, :] * L)  # (N_r, N_theta, N_z)
+    # Resample Cartesian -> Cylindrical
+    t = torch.linspace(0, 2 * torch.pi, N_theta + 1, device=device, dtype=dtype)[:-1]
+    z = (torch.arange(N_z, device=device, dtype=dtype) + 0.5) / N_z
+    grid = torch.empty((1, N_r, N_theta, N_z, 3), device=device, dtype=dtype)
+    grid[0, ..., 0] = r[:, None, None] * torch.cos(t[None, :, None])
+    grid[0, ..., 1] = r[:, None, None] * torch.sin(t[None, :, None])
+    grid[0, ..., 2] = (z[None, None, :] - 0.5 / N_z) / (1 - 1.0 / N_z) * 2 - 1
+    f = torch.nn.functional.grid_sample(data[None, None, ...], grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0]
 
-    E = np.exp(1j * t[:, None] * m[None, :])  # (N_theta, M+1)
-    S = np.sin(l[None, :] * np.pi * z[:, None])  # (N_z, K_z)
-    w = np.r_[1, [2] * M]
+    # Spectral Projections (FFT, Sine, Bessel)
+    F = torch.fft.rfft(f, dim=1)[:, : M + 1, :] * (2 * torch.pi / N_theta)  # (N_r, M+1, N_z)
+    k = torch.arange(1, K_z + 1, device=device, dtype=dtype)  # (K_z,)
+    S = torch.sin(k[:, None] * torch.pi * z[None, :]).to(cdtype)  # (K_z, N_z)
+    coeffs = torch.einsum("rmz, lz, r, r, mkr -> mkl", F, S, r, w, J) / N_z  # (M+1, K_r, K_z)
+
+    # Normalization
+    norms = torch.from_numpy(disk.norm_factors(M, K_r)).to(device, cdtype)
+    return coeffs / (norms[:, :, None] / 2)
+
+
+def inverse_transform_torch(coeffs, N_xy, N_z, N_r=None, N_theta=None):
+    assert coeffs.ndim == 3
+    device, cdtype = coeffs.device, coeffs.dtype
+    dtype = torch.float64 if cdtype == torch.complex128 else torch.float32
+
+    M, K_r, K_z = coeffs.shape[0] - 1, coeffs.shape[1], coeffs.shape[2]
+    N_r = N_r or int(np.hypot(N_xy, N_xy))
+    N_theta = N_theta or int(scipy.fft.next_fast_len(int(2 * np.pi * N_r)))  # type: ignore
+
+    # Basis functions
+    z = (torch.arange(N_z, device=device, dtype=dtype) + 0.5) / N_z  # (N_z,)
+    k = torch.arange(1, K_z + 1, device=device, dtype=dtype)  # (K_z,)
+    S = torch.sin(k[:, None] * torch.pi * z[None, :]).to(cdtype)  # (K_z, N_z)
+    _, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
+    J = torch.from_numpy(J).to(device=device, dtype=cdtype)  # (M+1, K_r, N_r)
+
+    # Project to Cylindrical Grid
+    C = torch.einsum("mkl, lz, mkr -> mrz", coeffs, S, J)  # (M+1, N_r, N_z)
+    f = torch.fft.irfft(C, n=N_theta, dim=0) * N_theta  # (N_theta, N_r, N_z)
+    f = torch.cat([f, f[:1, :, :]], dim=0)  # (N_theta+1, N_r, N_z)
+
+    # Coordinate Mapping (Normalized)
+    Y, X = torch.meshgrid(*[torch.linspace(-1, 1, N_xy, device=device, dtype=dtype)] * 2, indexing="ij")
+    Rs, Ts = torch.hypot(X, Y), torch.atan2(Y, X) % (2 * torch.pi)
+
+    grid = torch.empty((1, N_z, N_xy, N_xy, 3), device=device, dtype=dtype)
+    grid[0, ..., 0] = (z[:, None, None] - 0.5 / N_z) / (1 - 1.0 / N_z) * 2 - 1
+    grid[0, ..., 1] = Rs[None, :, :] * 2 - 1
+    grid[0, ..., 2] = (Ts[None, :, :] / (2 * torch.pi)) * 2 - 1
+
+    return torch.nn.functional.grid_sample(f[None, None, ...], grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0, ...]
+
+
+def fit(data, M, K_r, K_z, N_r=None, N_theta=None, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion=None, epochs=1000, log_interval=None, device=None):
+    """
+    Fit spectral coefficients to a 3D data grid using gradient descent.
+    """
+    assert data.ndim == 3 and data.shape[1] == data.shape[2]
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(data, np.ndarray):
+        data = torch.from_numpy(data).to(device=device)
+    else:
+        data = data.detach().to(device=device)
+    data = data.detach()
+    dtype, (N_z, N_xy, _) = data.dtype, data.shape
+    cdtype = torch.complex64 if dtype == torch.float32 else torch.complex128
 
     if init_coeffs is None:
-        init_coeffs = transform(func, R, L, M, K_r, K_z, N_r, N_theta, N_z, method="legendre")
-    coeffs = torch.tensor(init_coeffs, dtype=torch.complex64, device=device, requires_grad=True)
-
-    J = torch.from_numpy(J).to(device=device, dtype=torch.complex64)
-    E = torch.from_numpy(E).to(device=device, dtype=torch.complex64)
-    S = torch.from_numpy(S).to(device=device, dtype=torch.complex64)
-    w = torch.from_numpy(w).to(device=device, dtype=torch.complex64)
-    f_true = torch.from_numpy(f_true).to(device=device, dtype=torch.float32)
+        coeffs = transform_torch(data, M, K_r, K_z, N_r=N_r, N_theta=N_theta).requires_grad_(True)
+    else:
+        coeffs = torch.tensor(init_coeffs, dtype=cdtype, device=device, requires_grad=True)
 
     criterion = criterion or torch.nn.functional.mse_loss
     optimizer = torch.optim.Adam([coeffs], lr=lr)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=epochs)
 
     for i in range(epochs):
         optimizer.zero_grad()
-
-        f = torch.einsum("mkl, zl, mkr, tm, m -> rtz", coeffs, S, J, E, w).real
-
+        f = inverse_transform_torch(coeffs, N_xy, N_z, N_r=N_r, N_theta=N_theta)
         if activation:
             f = activation(f)
 
-        loss = criterion(f, f_true)
+        loss = criterion(f, data)
         if reg:
             loss = loss + reg(coeffs)
 
         loss.backward()
-
         optimizer.step()
+        if scheduler:
+            scheduler.step()
 
-        if verbose and i % 10 == 0:
-            print(f"Iter {i}: Loss {loss.item():.6e}")
+        if log_interval is not None and i % log_interval == 0:
+            print(f"Fit Iter {i}: Loss {loss.item():.6e}")
 
-    return coeffs.detach().cpu().numpy()
+    with torch.inference_mode():
+        f = inverse_transform_torch(coeffs, N_xy, N_z, N_r=N_r, N_theta=N_theta)
+        if activation:
+            f = activation(f)
+
+    return coeffs.detach().cpu().numpy(), f.detach().cpu().numpy()
 
 
 if __name__ == "__main__":
@@ -355,17 +366,26 @@ if __name__ == "__main__":
     print("=" * 58)
     print(f"Cyl. Spec. Decomp. (R={R}, L={L}, M={M}, K={K_R}x{K_Z})")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     # Transform and Reconstruction
     c_dir = transform(observed_func, R, L, M, K_R, K_Z, N_R, N_z=N_Z)
-    c_fit = fit(observed_func, R, L, M, K_R, K_Z, N_R, N_theta=100, N_z=N_Z, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), init_coeffs=c_dir, lr=0.05, epochs=200)
     c_fast = transform_fast(observed_func, R, L, M, K_R, K_Z, N_R, N_z=N_Z)
     Xs, Ys, Zs, f_rec = inverse_transform(c_dir, R, L, N_XY, N_Z)
     Xs, Ys, Zs, f_fast = inverse_transform_fast(c_dir, R, L, N_XY, N_Z)
-    Xs, Ys, Zs, f_fit = inverse_transform(c_fit, R, L, N_XY, N_Z)
-    f_fit = np.clip(f_fit, CLIP_MIN, CLIP_MAX)
+    f_torch = inverse_transform_torch(torch.from_numpy(c_dir).to(device), N_XY, N_Z).cpu().numpy()
+    np.testing.assert_allclose(f_torch, f_fast, atol=1e-14)
+
     Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)
     f_lat = latent_func(Rs, Ts, Zs) * (Rs <= R)
     f_obs = observed_func(Rs, Ts, Zs) * (Rs <= R)
+
+    print("Fitting...")
+    activation = lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX)  # noqa: E731
+    c_fit, f_fit_torch = fit(f_obs, M, K_R, K_Z, activation=activation, init_coeffs=c_dir, log_interval=100)
+    Xs, Ys, Zs, f_fit_raw = inverse_transform_fast(c_fit, R, L, N_XY, N_Z)
+    f_fit = np.clip(f_fit_raw, CLIP_MIN, CLIP_MAX)
+    np.testing.assert_allclose(f_fit_torch, f_fit, atol=1e-14)
 
     def stats(name, d):
         print(f"{name:<25} | MaxAbs: {np.max(d):.1e} | MSE: {np.mean(d**2):.1e}")

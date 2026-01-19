@@ -1,5 +1,6 @@
 import numpy as np
 import scipy.fft
+import torch
 
 
 def samples(N):
@@ -95,101 +96,90 @@ def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
     return x * L, f
 
 
-def transform_fast(func, L, K, N=1000):
+def transform_fast(func, L, K, N=1000) -> np.ndarray:
     x = samples(N)  # (N，)
     f = func(x * L)  # (N,)
     return scipy.fft.dst(f, overwrite_x=True)[:K] / N  # type: ignore
 
 
-def inverse_transform_fast(coeffs, L, N=256):
+def inverse_transform_fast(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
     x = samples(N)  # (N，)
     f = scipy.fft.idst(coeffs * N, n=N, overwrite_x=True)
-    return x * L, f
+    return x * L, f  # type: ignore[return-value]
 
 
-def fit(func, L, K, N=1000, activation=None, reg=None, init_coeffs=None, lr=1e-2, criterion=None, epochs=200, verbose=False, device=None):
+def transform_torch(data, K):
+    assert data.ndim == 1
+    device, dtype = data.device, data.dtype
+    N = data.shape[0]
+    x = (torch.arange(N, device=device, dtype=dtype) + 0.5) / N
+    k = torch.arange(1, K + 1, device=device, dtype=dtype)
+    S = torch.sin(k[:, None] * torch.pi * x[None, :])  # (K, N)
+    coeffs = (2 / N) * torch.einsum("x, kx -> k", data, S)  # (K,)
+    return coeffs
+
+
+def inverse_transform_torch(coeffs, N):
+    assert coeffs.ndim == 1
+    device, dtype = coeffs.device, coeffs.dtype
+    K = coeffs.shape[0]
+    x = (torch.arange(N, device=device, dtype=dtype) + 0.5) / N
+    k = torch.arange(1, K + 1, device=device, dtype=dtype)
+    S = torch.sin(k[:, None] * torch.pi * x[None, :])  # (K, N)
+    f = torch.einsum("k, kx -> x", coeffs, S)  # (N,)
+    return f  # type: ignore[return-value]
+
+
+def fit(data, K, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion=None, epochs=1000, log_interval=None, device=None):
     """
     Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing.
-
-    Parameters
-    ----------
-    func : callable
-        A function of one variable (x) defined on the interval [0, L].
-    L : float
-        The length of the interval.
-    K : int
-        The number of sine modes to compute.
-    N : int, optional
-        Number of spatial sample points for fitting.
-    activation : callable, optional
-        Post-processing function applied to the reconstruction before computing loss.
-    reg : callable, optional
-        Regularization function on coefficients. Default is no regularization.
-    init_coeffs : np.ndarray, optional
-        Initial coefficients for optimization. If None, uses direct transform.
-    lr : float
-        Learning rate.
-    criterion : callable, optional
-        Loss function (pred, target). Default is MSE.
-    epochs : int
-        Number of optimization iterations.
-    verbose : bool
-        Whether to print progress.
-    device : str, optional
-        Device for computation ('cpu' or 'cuda'). Defaults to 'cuda' if available.
-
-    Returns
-    -------
-    coeffs : np.ndarray
-        Optimized coefficients of shape (K,).
-
     """
-    import torch
-
+    assert data.ndim == 1
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if isinstance(data, np.ndarray):
+        data = torch.from_numpy(data).to(device=device)
+    else:
+        data = data.detach().to(device=device)
 
-    # Sample on grid
-    x = samples(N)  # (N,)
-    k = np.arange(1, K + 1)  # (K,)
-
-    # Target values
-    f_true = func(x * L)  # (N,)
-
-    S = np.sin(k[:, None] * np.pi * x[None, :])  # (K, N)
+    N = data.shape[0]  # infer N from input
+    dtype = data.dtype
 
     if init_coeffs is None:
-        init_coeffs = transform(func, L, K, N)
-    coeffs = torch.tensor(init_coeffs, dtype=torch.float32, device=device, requires_grad=True)
-
-    S = torch.from_numpy(S).to(device=device, dtype=torch.float32)
-    f_true = torch.from_numpy(f_true).to(device=device, dtype=torch.float32)
+        coeffs = transform_torch(data, K).requires_grad_(True)
+    else:
+        coeffs = torch.tensor(init_coeffs, dtype=dtype, device=device, requires_grad=True)
 
     criterion = criterion or torch.nn.functional.mse_loss
     optimizer = torch.optim.Adam([coeffs], lr=lr)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=epochs) if epochs > 50 else None
 
     for i in range(epochs):
         optimizer.zero_grad()
-
-        f = torch.einsum("k, kx -> x", coeffs, S)
-
+        f = inverse_transform_torch(coeffs, N)
         if activation:
             f = activation(f)
 
-        loss = criterion(f, f_true)
+        loss = criterion(f, data)
         if reg:
             loss = loss + reg(coeffs)
 
         loss.backward()
         optimizer.step()
+        if scheduler:
+            scheduler.step()
 
-        if verbose and i % 10 == 0:
-            print(f"Iter {i}: Loss {loss.item():.6e}")
+        if log_interval is not None and i % log_interval == 0:
+            print(f"Fit Iter {i}: Loss {loss.item():.6e}")
 
-    return coeffs.detach().cpu().numpy()
+    with torch.inference_mode():
+        f = inverse_transform_torch(coeffs, N)
+        if activation:
+            f = activation(f)
+
+    return coeffs.detach().cpu().numpy(), f.detach().cpu().numpy()
 
 
 if __name__ == "__main__":
-    import torch
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -212,15 +202,26 @@ if __name__ == "__main__":
     print("=" * 58)
     print(f"Interval Spec. Decomp. (L={L}, K={K})")
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
     c_dir = transform(observed_func, L, K, N=N)
-    c_fit = fit(observed_func, L, K, N=N, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), init_coeffs=c_dir, lr=0.05, epochs=400)
     c_fast = transform_fast(observed_func, L, K, N=N)
     Xs, f_rec = inverse_transform(c_dir, L, N=N)
     Xs, f_fast = inverse_transform_fast(c_dir, L, N=N)
+    f_torch = inverse_transform_torch(torch.from_numpy(c_dir).to(device), N).cpu().numpy()
+    np.testing.assert_allclose(f_torch, f_fast, atol=1e-14)
+
+    f_obs = observed_func(Xs)  # (N,)
+
+    print("Fitting...")
+    activation = lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX)  # noqa: E731
+    c_fit, f_fit_torch = fit(f_obs, K, activation=activation, init_coeffs=c_dir, log_interval=100)
+
     Xs, f_fit_raw = inverse_transform(c_fit, L, N=N)
     f_fit = np.clip(f_fit_raw, CLIP_MIN, CLIP_MAX)
+    np.testing.assert_allclose(f_fit_torch, f_fit, atol=1e-14)
+
     f_lat = latent_func(Xs)
-    f_obs = observed_func(Xs)
 
     def stats(name, d):
         print(f"{name:<25} | MaxAbs: {np.max(d):.1e} | MSE: {np.mean(d**2):.1e}")
