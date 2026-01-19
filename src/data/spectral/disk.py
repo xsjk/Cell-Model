@@ -251,7 +251,7 @@ def inverse_transform_fast(coeffs, R, N=256, N_theta=None) -> tuple[np.ndarray, 
     return Xs, Ys, f
 
 
-def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, lr=1e-2, epochs=200, verbose=False, device=None):
+def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, init_coeffs=None, lr=1e-2, criterion=None, epochs=200, verbose=False, device=None):
     """
     Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing (e.g. clipping).
     Uses gradient descent to optimize coefficients to minimize MSE after activation.
@@ -273,10 +273,18 @@ def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, lr=1e-2,
         Useful for handling clipping or other non-linearities.
     reg : callable, optional
         Regularization function on coefficients. Default is no regularization.
+    init_coeffs : np.ndarray, optional
+        Initial coefficients for optimization. If None, uses direct transform.
     lr : float
         Learning rate.
+    criterion: callable, optional
+        Loss function (pred, target). Default is MSE.
     epochs : int
         Number of optimization steps.
+    verbose : bool
+        Whether to print progress.
+    device : str, optional
+        Device for computation ('cpu' or 'cuda'). Defaults to 'cuda' if available.
 
     Returns
     -------
@@ -299,7 +307,8 @@ def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, lr=1e-2,
     E = np.exp(1j * t[:, None] * m[None, :])  # (N_theta, M+1)
     w = np.r_[1, [2] * M]
 
-    init_coeffs = transform(func, R, M, K, N_r, N_theta, method="legendre")
+    if init_coeffs is None:
+        init_coeffs = transform(func, R, M, K, N_r, N_theta, method="legendre")
     coeffs = torch.tensor(init_coeffs, dtype=torch.complex64, device=device, requires_grad=True)
 
     J = torch.from_numpy(J).to(device=device, dtype=torch.complex64)
@@ -307,9 +316,7 @@ def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, lr=1e-2,
     w = torch.from_numpy(w).to(device=device, dtype=torch.complex64)
     f_true = torch.from_numpy(f_true).to(device=device, dtype=torch.float32)
 
-    def loss_fn(f):
-        return torch.nn.functional.mse_loss(f, f_true)
-
+    criterion = criterion or torch.nn.functional.mse_loss
     optimizer = torch.optim.Adam([coeffs], lr=lr)
 
     for i in range(epochs):
@@ -320,7 +327,7 @@ def fit(func, R, M, K, N_r=58, N_theta=None, activation=None, reg=None, lr=1e-2,
         if activation:
             f = activation(f)
 
-        loss = loss_fn(f)
+        loss = criterion(f, f_true)
         if reg:
             loss = loss + reg(coeffs)
 
@@ -361,7 +368,7 @@ if __name__ == "__main__":
 
     # Transform and Reconstruction
     c_dir = transform(observed_func, R, M, K, N_r=N_R)
-    c_fit = fit(observed_func, R, M, K, N_r=N_R, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), lr=0.01, epochs=200)
+    c_fit = fit(observed_func, R, M, K, N_r=N_R, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), init_coeffs=c_dir, lr=0.01, epochs=200)
     c_fast = transform_fast(observed_func, R, M, K, N_r=N_R)
     Xs, Ys, f_rec = inverse_transform(c_dir, R, N=N_XY)
     Xs, Ys, f_fast = inverse_transform_fast(c_dir, R, N=N_XY)

@@ -96,31 +96,53 @@ def inverse_transform(coeffs, L, N=256) -> tuple[np.ndarray, np.ndarray]:
 
 
 def transform_fast(func, L, K, N=1000):
-    """
-    Fast computation of the sine spectral coefficients using the Discrete Sine Transform (DST).
-    The function should satisfy Dirichlet boundary conditions f(0) = f(L) = 0.
-
-    See the `transform` function for interface details.
-    """
     x = samples(N)  # (N，)
     f = func(x * L)  # (N,)
     return scipy.fft.dst(f, overwrite_x=True)[:K] / N  # type: ignore
 
 
 def inverse_transform_fast(coeffs, L, N=256):
-    """
-    Fast reconstruction of the function from its sine spectral coefficients using the Inverse Discrete Sine Transform (IDST).
-
-    See the `inverse_transform` function for interface details.
-    """
     x = samples(N)  # (N，)
     f = scipy.fft.idst(coeffs * N, n=N, overwrite_x=True)
     return x * L, f
 
 
-def fit(func, L, K, N=1000, activation=None, reg=None, lr=1e-2, epochs=200, verbose=False, device=None):
+def fit(func, L, K, N=1000, activation=None, reg=None, init_coeffs=None, lr=1e-2, criterion=None, epochs=200, verbose=False, device=None):
     """
     Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing.
+
+    Parameters
+    ----------
+    func : callable
+        A function of one variable (x) defined on the interval [0, L].
+    L : float
+        The length of the interval.
+    K : int
+        The number of sine modes to compute.
+    N : int, optional
+        Number of spatial sample points for fitting.
+    activation : callable, optional
+        Post-processing function applied to the reconstruction before computing loss.
+    reg : callable, optional
+        Regularization function on coefficients. Default is no regularization.
+    init_coeffs : np.ndarray, optional
+        Initial coefficients for optimization. If None, uses direct transform.
+    lr : float
+        Learning rate.
+    criterion : callable, optional
+        Loss function (pred, target). Default is MSE.
+    epochs : int
+        Number of optimization iterations.
+    verbose : bool
+        Whether to print progress.
+    device : str, optional
+        Device for computation ('cpu' or 'cuda'). Defaults to 'cuda' if available.
+
+    Returns
+    -------
+    coeffs : np.ndarray
+        Optimized coefficients of shape (K,).
+
     """
     import torch
 
@@ -135,16 +157,15 @@ def fit(func, L, K, N=1000, activation=None, reg=None, lr=1e-2, epochs=200, verb
 
     S = np.sin(k[:, None] * np.pi * x[None, :])  # (K, N)
 
-    init_coeffs = transform(func, L, K, N)
+    if init_coeffs is None:
+        init_coeffs = transform(func, L, K, N)
     coeffs = torch.tensor(init_coeffs, dtype=torch.float32, device=device, requires_grad=True)
 
     S = torch.from_numpy(S).to(device=device, dtype=torch.float32)
     f_true = torch.from_numpy(f_true).to(device=device, dtype=torch.float32)
 
+    criterion = criterion or torch.nn.functional.mse_loss
     optimizer = torch.optim.Adam([coeffs], lr=lr)
-
-    def loss_fn(f):
-        return torch.nn.functional.mse_loss(f, f_true)
 
     for i in range(epochs):
         optimizer.zero_grad()
@@ -154,7 +175,7 @@ def fit(func, L, K, N=1000, activation=None, reg=None, lr=1e-2, epochs=200, verb
         if activation:
             f = activation(f)
 
-        loss = loss_fn(f)
+        loss = criterion(f, f_true)
         if reg:
             loss = loss + reg(coeffs)
 
@@ -192,7 +213,7 @@ if __name__ == "__main__":
     print(f"Interval Spec. Decomp. (L={L}, K={K})")
 
     c_dir = transform(observed_func, L, K, N=N)
-    c_fit = fit(observed_func, L, K, N=N, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), lr=0.05, epochs=400)
+    c_fit = fit(observed_func, L, K, N=N, activation=lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX), init_coeffs=c_dir, lr=0.05, epochs=400)
     c_fast = transform_fast(observed_func, L, K, N=N)
     Xs, f_rec = inverse_transform(c_dir, L, N=N)
     Xs, f_fast = inverse_transform_fast(c_dir, L, N=N)
