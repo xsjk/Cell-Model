@@ -119,20 +119,46 @@ def transform_torch(data, K):
     return coeffs
 
 
-def inverse_transform_torch(coeffs, N):
+def evaluate_basis_torch(coeffs, x):
     assert coeffs.ndim == 1
     device, dtype = coeffs.device, coeffs.dtype
     K = coeffs.shape[0]
-    x = (torch.arange(N, device=device, dtype=dtype) + 0.5) / N
     k = torch.arange(1, K + 1, device=device, dtype=dtype)
-    S = torch.sin(k[:, None] * torch.pi * x[None, :])  # (K, N)
-    f = torch.einsum("k, kx -> x", coeffs, S)  # (N,)
-    return f  # type: ignore[return-value]
+    S = torch.sin(k[:, None] * torch.pi * x[None, :])
+    f = torch.einsum("k, kx -> x", coeffs, S)
+    return f
 
 
-def fit(data, K, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion=None, epochs=1000, log_interval=None, device=None):
+def inverse_transform_torch(coeffs, N, bounds=(0, 1)):
+    assert coeffs.ndim == 1
+    device, dtype = coeffs.device, coeffs.dtype
+    a, b = bounds[0], bounds[1]
+    x = a + (b - a) * ((torch.arange(N, device=device, dtype=dtype) + 0.5) / N)
+    return evaluate_basis_torch(coeffs, x)
+
+
+def fit(
+    data,
+    K,
+    activation=None,
+    reg=None,
+    init_coeffs=None,
+    lr=5e-2,
+    criterion=None,
+    epochs=1000,
+    log_interval=None,
+    device=None,
+    bounds=(0, 1),
+):
     """
     Compute spectral coefficients by fitting reconstruction to sampled values, supporting custom post-processing.
+
+    Returns
+    -------
+    coeffs : np.ndarray
+        Fitted spectral coefficients.
+    f_fit : np.ndarray
+        Reconstructed function values on the observation grid.
     """
     assert data.ndim == 1
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -155,7 +181,8 @@ def fit(data, K, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion
 
     for i in range(epochs):
         optimizer.zero_grad()
-        f = inverse_transform_torch(coeffs, N)
+        f = inverse_transform_torch(coeffs, N, bounds=bounds)
+
         if activation:
             f = activation(f)
 
@@ -165,6 +192,7 @@ def fit(data, K, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion
 
         loss.backward()
         optimizer.step()
+
         if scheduler:
             scheduler.step()
 
@@ -172,7 +200,7 @@ def fit(data, K, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion
             print(f"Fit Iter {i}: Loss {loss.item():.6e}")
 
     with torch.inference_mode():
-        f = inverse_transform_torch(coeffs, N)
+        f = inverse_transform_torch(coeffs, N, bounds=bounds)
         if activation:
             f = activation(f)
 
@@ -199,89 +227,96 @@ if __name__ == "__main__":
     K = 30
     N = 500
 
+    # Data Setup
+    TRUE_A, TRUE_B = 0, 0.8
+    x = (TRUE_A + (TRUE_B - TRUE_A) * samples(N)) * L
+    f_obs = observed_func(x)
+    f_lat = latent_func(x)
+    x_full = samples(N) * L
+    f_lat_full = latent_func(x_full)
+    f_obs_full = observed_func(x_full)
+
     print("=" * 58)
     print(f"Interval Spec. Decomp. (L={L}, K={K})")
+    print(f"Observation interval: [{TRUE_A:.2f}, {TRUE_B:.2f}]")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    c_dir = transform(observed_func, L, K, N=N)
-    c_fast = transform_fast(observed_func, L, K, N=N)
-    Xs, f_rec = inverse_transform(c_dir, L, N=N)
-    Xs, f_fast = inverse_transform_fast(c_dir, L, N=N)
-    f_torch = inverse_transform_torch(torch.from_numpy(c_dir).to(device), N).cpu().numpy()
-    np.testing.assert_allclose(f_torch, f_fast, atol=1e-14)
+    # Transform and Reconstruction
+    ## Direct Transform (assumes full interval [0, 1])
+    c_dir = scipy.fft.dst(f_obs, overwrite_x=False)[:K] / N  # type: ignore[assignment]
+    _, f_rec = inverse_transform(c_dir, L, N=N)
 
-    f_obs = observed_func(Xs)  # (N,)
-
-    print("Fitting...")
+    ## Fitted Recon (Fixed bounds [0, 1] with clipping activation)
+    print("Fitting (Fixed Bounds)...")
     activation = lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX)  # noqa: E731
-    c_fit, f_fit_torch = fit(f_obs, K, activation=activation, init_coeffs=c_dir, log_interval=100)
+    c_fit, f_fit = fit(f_obs, K, activation=activation, log_interval=200)
 
-    Xs, f_fit_raw = inverse_transform(c_fit, L, N=N)
-    f_fit = np.clip(f_fit_raw, CLIP_MIN, CLIP_MAX)
-    np.testing.assert_allclose(f_fit_torch, f_fit, atol=1e-14)
+    ## Fitted Recon (Manual bounds [TRUE_A, TRUE_B] with clipping activation)
+    print("Fitting (Manual Bounds)...")
+    c_fit_man, f_fit_man = fit(f_obs, K, activation=activation, bounds=(TRUE_A, TRUE_B), log_interval=200)
 
-    f_lat = latent_func(Xs)
+    def get_full_recon(coeffs: np.ndarray, bounds=(0, 1)) -> np.ndarray:
+        with torch.no_grad():
+            a, b = bounds[0], bounds[1]
+            u = (samples(N) - TRUE_A) / (TRUE_B - TRUE_A)
+            u = torch.from_numpy(a + (b - a) * u).to(device=device, dtype=torch.float32)
+            c_torch = torch.from_numpy(coeffs).to(device=device, dtype=torch.float32)
+            return evaluate_basis_torch(c_torch, u).cpu().numpy()
 
-    def stats(name, d):
-        print(f"{name:<25} | MaxAbs: {np.max(d):.1e} | MSE: {np.mean(d**2):.1e}")
-
-    print("-" * 58)
-    stats("Transform Diff (Fast-Std)", np.abs(c_dir - c_fast))
-    stats("InvTrans Diff (Fast-Std)", np.abs(f_rec - f_fast))
-    print("-" * 58)
-    stats("Observed vs Direct", np.abs(f_obs - f_rec))
-    stats("Observed vs Fitted", np.abs(f_obs - f_fit))
-    print("-" * 58)
+    f_fit_full = get_full_recon(c_fit)
+    f_fit_man_full = get_full_recon(c_fit_man, bounds=(TRUE_A, TRUE_B))
 
     # Visualization
     fig = make_subplots(
         rows=2,
-        cols=3,
+        cols=4,
         subplot_titles=(
-            "Observed (Clipped)",
-            "Direct Recon",
-            "Fitted Recon",
-            "Latent Truth",
-            "Direct Error",
-            "Fitted Error",
+            "Observed (Truncated X&Y)",
+            "Direct (Fixed [0,1])",
+            "Fitted (Fixed [0,1])",
+            "Fitted (Manual [a,b])",
+            "",  # Empty slot
+            "Direct Error (Trunc.)",
+            "Fixed Fit Error (Trunc.)",
+            "Manual Fit Error (Trunc.)",
         ),
         vertical_spacing=0.15,
     )
 
-    def add_line(r, c, y, name, color=None, dash=None):
+    def add_line(r, c, x, y, name, color=None, dash=None, showlegend=True):
         fig.add_trace(
             go.Scatter(
-                x=Xs,
+                x=x,
                 y=y,
                 mode="lines",
                 name=name,
                 line=dict(color=color, dash=dash),
+                showlegend=showlegend,
             ),
             row=r,
             col=c,
         )
 
-    add_line(1, 1, f_obs, "Observed", "cyan")
-    add_line(1, 2, f_rec, "Direct", "orange")
-    add_line(1, 3, f_fit, "Fitted(Clip)", "magenta")
-    add_line(1, 3, f_fit_raw, "Fitted(Raw)", "purple", "dot")
-    add_line(2, 1, f_lat, "Latent", "green")
-    add_line(2, 2, np.abs(f_rec - f_obs), "Err Direct", "red")
-    add_line(2, 3, np.abs(f_fit - f_obs), "Err Fitted", "red")
+    for col in range(1, 5):
+        add_line(1, col, x_full, f_lat_full, "Latent Full", "gray", "dash", showlegend=(col == 1))
+    add_line(1, 1, x, f_obs, "Observed", "cyan")
+    add_line(1, 2, x, f_rec, "Direct Slice", "orange")
+    add_line(1, 3, x_full, f_fit_full, "Fixed Fit Extrap.", "magenta", "dot")
+    add_line(1, 3, x, f_fit, "Fixed Fit Slice", "magenta", showlegend=False)
+    add_line(1, 4, x_full, f_fit_man_full, "Manual Fit Extrap.", "yellow", "dot")
+    add_line(1, 4, x, f_fit_man, "Manual Fit Slice", "yellow", showlegend=False)
+    add_line(2, 2, x, np.abs(f_rec - f_obs), "Err Direct", "red")
+    add_line(2, 3, x, np.abs(f_fit - f_obs), "Err Fixed", "red")
+    add_line(2, 4, x, np.abs(f_fit_man - f_obs), "Err Manual", "red")
+    v_min, v_max = f_lat_full.min(), f_lat_full.max()
+    max_err = max(np.abs(f_rec - f_obs).max(), np.abs(f_fit_man - f_obs).max())
 
-    fs = [f_obs, f_rec, f_fit, f_lat]
-    v_min, v_max = min(f.min() for f in fs), max(f.max() for f in fs)
-    max_err = np.abs(f_rec - f_obs).max()
-
+    fig.update_xaxes(range=[0, L])
+    fig.update_yaxes(range=[v_min, v_max], row=1)
+    fig.update_yaxes(range=[0, max_err], row=2)
     fig.update_layout(
-        title="Interval Clipped Reconstruction Benchmark",
+        title=f"Adaptive Interval Benchmark (L={L}, K={K})",
         template="plotly_dark",
-        yaxis1=dict(range=[v_min, v_max]),
-        yaxis2=dict(range=[v_min, v_max]),
-        yaxis3=dict(range=[v_min, v_max]),
-        yaxis4=dict(range=[v_min, v_max]),
-        yaxis5=dict(range=[0, max_err]),
-        yaxis6=dict(range=[0, max_err]),
     )
     fig.write_html("interval_decomposition.html", include_plotlyjs="cdn")

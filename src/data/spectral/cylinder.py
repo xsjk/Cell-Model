@@ -253,7 +253,7 @@ def transform_torch(data, M, K_r, K_z, N_r=None, N_theta=None, method: Literal["
     return coeffs / (norms[:, :, None] / 2)
 
 
-def inverse_transform_torch(coeffs, N_xy, N_z, N_r=None, N_theta=None):
+def inverse_transform_torch(coeffs, N_xy, N_z, N_r=None, N_theta=None, bounds_z=(0, 1)):
     assert coeffs.ndim == 3
     device, cdtype = coeffs.device, coeffs.dtype
     dtype = torch.float64 if cdtype == torch.complex128 else torch.float32
@@ -263,7 +263,8 @@ def inverse_transform_torch(coeffs, N_xy, N_z, N_r=None, N_theta=None):
     N_theta = N_theta or int(scipy.fft.next_fast_len(int(2 * np.pi * N_r)))  # type: ignore
 
     # Basis functions
-    z = (torch.arange(N_z, device=device, dtype=dtype) + 0.5) / N_z  # (N_z,)
+    a, b = bounds_z
+    z = a + (b - a) * (torch.arange(N_z, device=device, dtype=dtype) + 0.5) / N_z  # (N_z,)
     k = torch.arange(1, K_z + 1, device=device, dtype=dtype)  # (K_z,)
     S = torch.sin(k[:, None] * torch.pi * z[None, :]).to(cdtype)  # (K_z, N_z)
     _, J = disk.bessel_basis(M, K_r, N_r)  # (N_r,), (M+1, K_r, N_r)
@@ -278,15 +279,32 @@ def inverse_transform_torch(coeffs, N_xy, N_z, N_r=None, N_theta=None):
     Y, X = torch.meshgrid(*[torch.linspace(-1, 1, N_xy, device=device, dtype=dtype)] * 2, indexing="ij")
     Rs, Ts = torch.hypot(X, Y), torch.atan2(Y, X) % (2 * torch.pi)
 
+    z_samp = (torch.arange(N_z, device=device, dtype=dtype) + 0.5) / N_z
     grid = torch.empty((1, N_z, N_xy, N_xy, 3), device=device, dtype=dtype)
-    grid[0, ..., 0] = (z[:, None, None] - 0.5 / N_z) / (1 - 1.0 / N_z) * 2 - 1
+    grid[0, ..., 0] = (z_samp[:, None, None] - 0.5 / N_z) / (1 - 1.0 / N_z) * 2 - 1
     grid[0, ..., 1] = Rs[None, :, :] * 2 - 1
     grid[0, ..., 2] = (Ts[None, :, :] / (2 * torch.pi)) * 2 - 1
 
     return torch.nn.functional.grid_sample(f[None, None, ...], grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0, 0, ...]
 
 
-def fit(data, M, K_r, K_z, N_r=None, N_theta=None, activation=None, reg=None, init_coeffs=None, lr=5e-2, criterion=None, epochs=1000, log_interval=None, device=None):
+def fit(
+    data,
+    M,
+    K_r,
+    K_z,
+    N_r=None,
+    N_theta=None,
+    activation=None,
+    reg=None,
+    init_coeffs=None,
+    lr=5e-2,
+    criterion=None,
+    epochs=1000,
+    log_interval=None,
+    device=None,
+    bounds_z=(0, 1),
+):
     """
     Fit spectral coefficients to a 3D data grid using gradient descent.
     """
@@ -311,7 +329,7 @@ def fit(data, M, K_r, K_z, N_r=None, N_theta=None, activation=None, reg=None, in
 
     for i in range(epochs):
         optimizer.zero_grad()
-        f = inverse_transform_torch(coeffs, N_xy, N_z, N_r=N_r, N_theta=N_theta)
+        f = inverse_transform_torch(coeffs, N_xy, N_z, N_r=N_r, N_theta=N_theta, bounds_z=bounds_z)
         if activation:
             f = activation(f)
 
@@ -328,7 +346,7 @@ def fit(data, M, K_r, K_z, N_r=None, N_theta=None, activation=None, reg=None, in
             print(f"Fit Iter {i}: Loss {loss.item():.6e}")
 
     with torch.inference_mode():
-        f = inverse_transform_torch(coeffs, N_xy, N_z, N_r=N_r, N_theta=N_theta)
+        f = inverse_transform_torch(coeffs, N_xy, N_z, N_r=N_r, N_theta=N_theta, bounds_z=bounds_z)
         if activation:
             f = activation(f)
 
@@ -338,6 +356,7 @@ def fit(data, M, K_r, K_z, N_r=None, N_theta=None, activation=None, reg=None, in
 if __name__ == "__main__":
     import torch
     from plotly.subplots import make_subplots
+    from plotly import graph_objects as go
 
     from ...visualization.objects import VoxelIsosurface
 
@@ -368,34 +387,38 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Transform and Reconstruction
-    c_dir = transform(observed_func, R, L, M, K_R, K_Z, N_R, N_z=N_Z)
-    c_fast = transform_fast(observed_func, R, L, M, K_R, K_Z, N_R, N_z=N_Z)
-    Xs, Ys, Zs, f_rec = inverse_transform(c_dir, R, L, N_XY, N_Z)
-    Xs, Ys, Zs, f_fast = inverse_transform_fast(c_dir, R, L, N_XY, N_Z)
-    f_torch = inverse_transform_torch(torch.from_numpy(c_dir).to(device), N_XY, N_Z).cpu().numpy()
-    np.testing.assert_allclose(f_torch, f_fast, atol=1e-14)
+    # Data Setup
+    TRUE_A_Z, TRUE_B_Z = 0.4, 0.8
+    print(f"Observation interval (z): [{TRUE_A_Z:.2f}, {TRUE_B_Z:.2f}]")
 
+    x = np.linspace(-R, R, N_XY)
+    Xs, Ys = np.meshgrid(x, x, indexing="ij")
     Rs, Ts = np.hypot(Xs, Ys), np.arctan2(Ys, Xs)
-    f_lat = latent_func(Rs, Ts, Zs) * (Rs <= R)
-    f_obs = observed_func(Rs, Ts, Zs) * (Rs <= R)
+    z_full = interval.samples(N_Z) * L
+    z_obs = (TRUE_A_Z + (TRUE_B_Z - TRUE_A_Z) * interval.samples(N_Z)) * L
+    f_lat_full = latent_func(Rs[None, :, :], Ts[None, :, :], z_full[:, None, None]) * (Rs <= R)[None, :, :]
+    f_obs_full = observed_func(Rs[None, :, :], Ts[None, :, :], z_full[:, None, None]) * (Rs <= R)[None, :, :]
+    f_obs_truncated = observed_func(Rs[None, :, :], Ts[None, :, :], z_obs[:, None, None]) * (Rs <= R)[None, :, :]
 
-    print("Fitting...")
-    activation = lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX)  # noqa: E731
-    c_fit, f_fit_torch = fit(f_obs, M, K_R, K_Z, activation=activation, init_coeffs=c_dir, log_interval=100)
-    Xs, Ys, Zs, f_fit_raw = inverse_transform_fast(c_fit, R, L, N_XY, N_Z)
-    f_fit = np.clip(f_fit_raw, CLIP_MIN, CLIP_MAX)
-    np.testing.assert_allclose(f_fit_torch, f_fit, atol=1e-14)
+    # Transform and Reconstruction
+    ## Direct Transform (treating truncated slices as full [0, 1] relative depth)
+    c_dir = transform_torch(torch.from_numpy(f_obs_truncated).to(device), M, K_R, K_Z).cpu().numpy()
+    _, _, _, f_rec_dir = inverse_transform_fast(c_dir, R, L, N_XY, N_Z)
+
+    print("Fitting Truncated Data with Manual Bounds...")
+    activation = lambda x: torch.clamp(x, CLIP_MIN, CLIP_MAX) if CLIP_MAX is not None else x  # noqa: E731
+    c_fit, f_fit_slice = fit(f_obs_truncated, M, K_R, K_Z, activation=activation, bounds_z=(TRUE_A_Z, TRUE_B_Z), log_interval=100)
+
+    # Reconstruct FULL volume from c_fit to see extrapolation/interpolation
+    Xs, Ys, Zs, f_fit_full = inverse_transform_fast(c_fit, R, L, N_XY, N_Z)
+    f_fit_full = np.clip(f_fit_full, CLIP_MIN, CLIP_MAX) if CLIP_MAX is not None else f_fit_full
 
     def stats(name, d):
         print(f"{name:<25} | MaxAbs: {np.max(d):.1e} | MSE: {np.mean(d**2):.1e}")
 
     print("-" * 58)
-    stats("Transform Diff (Fast-Std)", np.abs(c_dir - c_fast))
-    stats("InvTrans Diff (Fast-Std)", np.abs(f_rec - f_fast))
-    print("-" * 58)
-    stats("Observed vs Direct", np.abs(f_obs - f_rec))
-    stats("Observed vs Fitted", np.abs(f_obs - f_fit))
+    stats("Observed vs Direct", np.abs(f_obs_truncated - f_rec_dir))
+    stats("Observed vs Fitted", np.abs(f_obs_truncated - f_fit_slice))
     print("-" * 58)
 
     # Visualization
@@ -403,24 +426,24 @@ if __name__ == "__main__":
         rows=2,
         cols=3,
         subplot_titles=(
-            "Observed (Clipped)",
-            "Direct Recon",
-            "Fitted Recon",
-            "Latent Truth",
-            "Direct Error",
-            "Fitted Error",
+            f"Observed Z=[{TRUE_A_Z},{TRUE_B_Z}]",
+            "Direct (Fixed Z=[0,1])",
+            "Fitted (Manual [a,b])",
+            "Latent Full Z=[0,1]",
+            "Direct Error (Trunc.)",
+            "Fitted Error (Manual)",
         ),
         specs=[[{"type": "volume"}] * 3] * 2,
         vertical_spacing=0.03,
         horizontal_spacing=0.03,
     )
 
-    def add_iso(r, c, vol, imin, imax, cmap="Plotly3", showscale=False):
+    def add_iso(r, c, vol, imin, imax, z_range=(0, L), cmap="Plotly3", showscale=False):
         fig.add_traces(
             VoxelIsosurface(
                 x_range=(-R, R),
                 y_range=(-R, R),
-                z_range=(0, L),
+                z_range=z_range,
                 value=vol,
                 isomin=imin,
                 isomax=imax,
@@ -433,21 +456,42 @@ if __name__ == "__main__":
             cols=c,
         )
 
-    fs = [f_obs, f_rec, f_fit, f_lat]
-    v_min, v_max = min(f.min() for f in fs), max(f.max() for f in fs)
-    max_err = np.abs(f_rec - f_obs).max()
+    def add_clip_plane(r, c, zp):
+        fig.add_trace(
+            go.Surface(
+                x=[-R, R],
+                y=[-R, R],
+                z=[[zp, zp], [zp, zp]],
+                opacity=0.2,
+                showscale=False,
+                colorscale=[[0, "cyan"], [1, "cyan"]],
+                hoverinfo="skip",
+            ),
+            row=r,
+            col=c,
+        )
 
-    add_iso(1, 1, f_obs, v_min, v_max)
-    add_iso(1, 2, f_rec, v_min, v_max)
-    add_iso(1, 3, f_fit, v_min, v_max)
-    add_iso(2, 1, f_lat, v_min, v_max)
-    add_iso(2, 2, np.abs(f_rec - f_obs), 0, max_err, "Hot", True)
-    add_iso(2, 3, np.abs(f_fit - f_obs), 0, max_err, "Hot")
+    v_min, v_max = f_lat_full.min(), f_lat_full.max()
+    max_err = np.max(np.abs(f_obs_truncated - f_rec_dir))
+
+    z_range = (TRUE_A_Z * L, TRUE_B_Z * L)
+    add_iso(1, 1, f_obs_truncated, v_min, v_max, z_range=z_range)
+    add_iso(1, 2, f_rec_dir, v_min, v_max, z_range=z_range)
+    add_iso(1, 3, f_fit_full, v_min, v_max, z_range=(0, L))
+    add_clip_plane(1, 3, TRUE_A_Z * L)
+    add_clip_plane(1, 3, TRUE_B_Z * L)
+    add_iso(2, 1, f_lat_full, v_min, v_max)
+    add_clip_plane(2, 1, TRUE_A_Z * L)
+    add_clip_plane(2, 1, TRUE_B_Z * L)
+    add_iso(2, 2, np.abs(f_rec_dir - f_obs_truncated), 0, max_err, z_range=z_range, cmap="Hot", showscale=True)
+    add_iso(2, 3, np.abs(f_fit_slice - f_obs_truncated), 0, max_err, z_range=z_range, cmap="Hot")
     fig.update_layout(
         template="plotly_dark",
-        title="Clipped Reconstruction Benchmark",
+        title="Cylindrical Spectral Fitting (Z-Truncation Benchmark)",
         margin=dict(l=10, r=10, t=30, b=10),
     )
-    for i in range(1, 7):
-        fig.layout[f"scene{i}" if i > 1 else "scene"].update(aspectratio=dict(x=1, y=1, z=L / (2 * R)))
+    fig.update_scenes(
+        aspectratio=dict(x=1, y=1, z=L / (2 * R)),
+        zaxis=dict(range=[0, L]),
+    )
     fig.write_html("cylinder_decomposition.html", include_plotlyjs="cdn")
